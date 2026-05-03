@@ -1,0 +1,32 @@
+name: Build rust rocket builder and runner images
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-22.04
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v3
+
+    - name: Install ginger-apps
+      run: bash -c "$(curl -fsSL https://raw.githubusercontent.com/ginger-society/infra-as-code-repo/main/rust-helpers/install-pipeline-clis.sh)"
+
+    - name: Authenticate with ginger-auth
+      id: ginger-auth
+      run: ginger-auth token-login ${{ secrets.GINGER_TOKEN }}
+
+    - name: Log in to Docker Hub
+      run: echo "${{ secrets.DOCKER_HUB_ACCESS_TOKEN }}" | docker login -u "${{ secrets.DOCKER_HUB_USERNAME }}" --password-stdin
+
+    - name: Build Rocket rust builder Docker image
+      run: docker build -t ${{ secrets.DOCKER_HUB_USERNAME }}/gitter:latest . --build-arg GINGER_TOKEN=${{ secrets.GINGER_TOKEN }} --platform="linux/amd64" 
+
+    - name: Push Rocket rust builder Docker image
+      run: docker push ${{ secrets.DOCKER_HUB_USERNAME }}/gitter:latest
+
