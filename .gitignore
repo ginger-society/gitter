@@ -1,4 +1,4 @@
 user_key*
-signing-keys
+signing-keys/ca_key
 admin_key*
 gitolite-admin
