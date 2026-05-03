@@ -1,0 +1,17 @@
+services:
+  gitolite:
+    build: .
+    ports:
+      - "8022:22"
+      - "2223:2223"
+    volumes:
+      - gitolite-data:/var/lib/git
+    secrets:
+      - admin_key.pub
+
+secrets:
+  admin_key.pub:
+    file: ./admin_key.pub
+
+volumes:
+  gitolite-data:
