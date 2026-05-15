@@ -5,13 +5,19 @@ services:
       - "8022:22"
       - "2223:2223" # debug port , use it when you want to run sshd manually while the sshd is running on 22 normally but unable to find the issue
     volumes:
-      - gitolite-data:/var/lib/git
+      - gitolite-data:/home/git
     secrets:
       - admin_key.pub # available as /run/secrets/admin_key.pub in the container, used to initialize gitolite with the admin's public key
-
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
 secrets:
   admin_key.pub:
     file: ./admin_key.pub
 
 volumes:
   gitolite-data:
+  redis-data:

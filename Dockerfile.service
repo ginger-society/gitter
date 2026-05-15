@@ -1,0 +1,43 @@
+# ── Build stage ───────────────────────────────────────────────────────────────
+FROM rust:1.78-slim AS builder
+
+WORKDIR /app
+
+# Cache dependencies layer
+COPY Cargo.toml Cargo.lock* ./
+RUN mkdir src && echo 'fn main(){}' > src/main.rs
+RUN cargo build --release 2>/dev/null || true
+RUN rm -f target/release/deps/gitolite_sidecar*
+
+# Build the real binary
+COPY src ./src
+RUN cargo build --release
+
+# ── Runtime stage ─────────────────────────────────────────────────────────────
+FROM debian:bookworm-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        git \
+        openssh-client \
+        ca-certificates \
+        curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Create unprivileged user
+RUN useradd -m -u 1000 sidecar
+
+# SSH directory (key mounts land here)
+RUN mkdir -p /home/sidecar/.ssh && chown -R sidecar:sidecar /home/sidecar/.ssh
+
+# Work directories
+RUN mkdir -p /data/gitolite-admin /data/gitolite-home /tmp/gitolite-backup \
+    && chown -R sidecar:sidecar /data /tmp/gitolite-backup
+
+COPY --from=builder /app/target/release/gitolite-sidecar /usr/local/bin/gitolite-sidecar
+RUN chmod +x /usr/local/bin/gitolite-sidecar
+
+USER sidecar
+
+EXPOSE 8080
+
+ENTRYPOINT ["/usr/local/bin/gitolite-sidecar"]

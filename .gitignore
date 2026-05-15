@@ -1,4 +1,9 @@
 user_key*
 signing-keys/ca_key
 admin_key*
-gitolite-admin
+admin-repo
+
+# Added by cargo
+
+/target
+
