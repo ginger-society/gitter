@@ -10,28 +10,39 @@ const BACKUP_WORK_DIR: &str = "/tmp/gitolite-backup";
 
 pub async fn run_backup(state: &AppState) -> Result<()> {
     let cfg = &state.0.config;
-    let projects_list = PathBuf::from("/data/gitolite-home/projects.list");
     let work_dir = PathBuf::from(BACKUP_WORK_DIR);
 
     info!("[backup] ══════════════════════════════════════");
     info!("[backup] hourly backup run starting");
     info!("[backup]   work dir      : {BACKUP_WORK_DIR}");
-    info!("[backup]   projects.list : {}", projects_list.display());
+    info!("[backup]   gitolite host : {}:{}", cfg.gitolite_host, cfg.gitolite_port);
     info!("[backup]   gh target     : {}", cfg.gh_ssh_prefix);
     info!("[backup] ══════════════════════════════════════");
 
     tokio::fs::create_dir_all(&work_dir).await?;
 
-    let repos = match list_gitolite_repos(&projects_list).await {
+    // Ask gitolite directly — the authoritative source
+    let repos = match list_gitolite_repos(
+        &cfg.gitolite_host,
+        cfg.gitolite_port,
+        &cfg.admin_ssh_key_path,
+    )
+    .await
+    {
         Ok(r) => r,
         Err(e) => {
-            warn!("[backup] ✗ could not read projects.list: {e:#}");
-            warn!("[backup] skipping this backup run");
+            warn!("[backup] ✗ failed to query gitolite for repo list: {e:#}");
+            warn!("[backup] aborting this backup run");
             return Ok(());
         }
     };
 
     let total = repos.len();
+    if total == 0 {
+        info!("[backup] no repos to back up — run complete");
+        return Ok(());
+    }
+
     let mut success = 0usize;
     let mut failure = 0usize;
 
@@ -52,7 +63,7 @@ pub async fn run_backup(state: &AppState) -> Result<()> {
         {
             Ok(_) => {
                 success += 1;
-                info!("[backup] [{}/{total}] ✓ '{repo}' mirrored", i + 1);
+                info!("[backup] [{}/{total}] ✓ '{repo}' done", i + 1);
             }
             Err(e) => {
                 failure += 1;

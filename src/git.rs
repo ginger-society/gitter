@@ -174,18 +174,77 @@ fn sanitise_filename(name: &str) -> String {
 
 // ── Backup helpers ───────────────────────────────────────────────────────────
 
-pub async fn list_gitolite_repos(projects_list_path: &Path) -> Result<Vec<String>> {
-    info!("[backup] reading repo list from {}", projects_list_path.display());
-    let content = tokio::fs::read_to_string(projects_list_path)
+/// Ask gitolite for its authoritative repo list by running:
+///   ssh -i <key> -p <port> git@<host> info
+///
+/// Output looks like:
+///   hello admin, this is git@gitolite running gitolite3 ...
+///
+///    R W    gitolite-admin
+///    R W    testing
+///    R W    some/nested-repo
+///
+/// We grab every indented line, strip the permission columns, and return the
+/// bare repo names. gitolite-admin is excluded — the sidecar already pushes
+/// it continuously.
+pub async fn list_gitolite_repos(
+    host: &str,
+    port: u16,
+    ssh_key: &str,
+) -> Result<Vec<String>> {
+    info!("[backup] querying gitolite for repo list via: ssh git@{host} info");
+
+    let output = Command::new("ssh")
+        .args([
+            "-i", ssh_key,
+            "-o", "StrictHostKeyChecking=no",
+            "-o", "UserKnownHostsFile=/dev/null",
+            "-o", "BatchMode=yes",
+            "-p", &port.to_string(),
+            &format!("git@{host}"),
+            "info",
+        ])
+        .output()
         .await
-        .context("read projects.list")?;
-    let repos: Vec<String> = content
+        .context("failed to run ssh git@{host} info")?;
+
+    // gitolite writes to stderr on some versions, stdout on others — merge both.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    if !output.status.success() {
+        for line in stderr.lines() {
+            warn!("[backup] gitolite stderr: {line}");
+        }
+        bail!(
+            "ssh git@{host} info exited {}: {}",
+            output.status,
+            stderr.trim()
+        );
+    }
+
+    debug!("[backup] gitolite info stdout:\n{stdout}");
+    if !stderr.trim().is_empty() {
+        debug!("[backup] gitolite info stderr:\n{stderr}");
+    }
+
+    // Each repo line is indented and looks like:  " R W    repo-name"
+    // The last whitespace-separated token is always the repo name.
+    let mut repos: Vec<String> = stdout
         .lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty())
-        .map(String::from)
+        .chain(stderr.lines())
+        .filter(|l| l.starts_with(' ') || l.starts_with('\t'))
+        .filter_map(|l| l.split_whitespace().last().map(String::from))
+        .filter(|name| name != "gitolite-admin")
+        .collect::<std::collections::HashSet<_>>() // dedup across stdout+stderr
+        .into_iter()
         .collect();
-    info!("[backup] found {} repos in projects.list", repos.len());
+
+    repos.sort();
+    info!("[backup] found {} repos via gitolite info (gitolite-admin excluded)", repos.len());
+    for r in &repos {
+        debug!("[backup]   {r}");
+    }
     Ok(repos)
 }
 
