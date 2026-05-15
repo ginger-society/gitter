@@ -14,9 +14,6 @@ COPY signing-keys/ca_key.pub /etc/ssh/ca_key.pub
 RUN chmod 644 /etc/ssh/ca_key.pub
 
 # authorized-principals: echo back the cert principal
-# sshd calls this as: authorized-principals <sysuser> <principal>
-# Any principal from a CA-signed cert is passed through;
-# gitolite enforces per-user/repo permissions independently.
 RUN printf '#!/bin/bash\necho "$2"\n' > /usr/local/bin/authorized-principals && \
     chmod 755 /usr/local/bin/authorized-principals
 
@@ -33,7 +30,6 @@ trap 'rm -f "$TMPF1" "$TMPF2"' EXIT
 
 case "$KEY_TYPE" in
   *-cert-v01@openssh.com)
-    # Cert path — never touches authorized_keys
     KEY_B64=$(echo "$AUTH_INFO" | awk '{print $3}')
     echo "$KEY_TYPE $KEY_B64" > "$TMPF1"
     GL_USER=$(ssh-keygen -L -f "$TMPF1" 2>/dev/null \
@@ -64,16 +60,13 @@ case "$KEY_TYPE" in
 
     GL_USER=""
     while IFS= read -r line; do
-      # Match any command= line that calls gitolite-shell (full path or bare)
       case "$line" in
         *gitolite-shell\ *) ;;
         *) continue ;;
       esac
 
-      # Extract username — the argument after gitolite-shell before the closing quote
       CANDIDATE_USER=$(echo "$line" | sed 's|.*gitolite-shell \([^"]*\)".*|\1|')
 
-      # Extract key type + base64 using awk — finds first field starting with ssh-/ecdsa-/sk-
       BARE_KEY=$(echo "$line" | awk '{
         for(i=1;i<=NF;i++) {
           if ($i ~ /^(ssh-|ecdsa-|sk-)/) {
@@ -111,6 +104,27 @@ case "$KEY_TYPE" in
 esac
 WRAPPER
 RUN chmod 755 /usr/local/bin/gitolite-cert-shell
+
+COPY target/release/ginger-gitter-pipeline-hook /usr/local/bin/ginger-gitter-pipeline-hook
+RUN chmod 755 /usr/local/bin/ginger-gitter-pipeline-hook
+
+# Post-receive hook — fires after every push to any repo.
+# gitolite copies hooks/common/* into every repo during compile,
+# so this automatically applies to all existing and future repos.
+# LOCAL_CODE in .gitolite.rc tells gitolite where to find this directory.
+RUN mkdir -p /home/git/.gitolite/local/hooks/common && \
+    cat > /home/git/.gitolite/local/hooks/common/post-receive <<'HOOK'
+#!/bin/bash
+set -euo pipefail
+read GL_OLDREV GL_NEWREV GL_REFNAME
+exec ginger-gitter-pipeline-hook \
+    "$GL_USER" \
+    "$GL_REPO" \
+    "$GL_REFNAME" \
+    "$GL_OLDREV" \
+    "$GL_NEWREV"
+HOOK
+RUN chmod +x /home/git/.gitolite/local/hooks/common/post-receive
 
 # Patch sshd_config
 RUN cat >> /etc/ssh/sshd_config <<'EOF'
