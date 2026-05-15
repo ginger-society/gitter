@@ -1,33 +1,22 @@
 /// Git operations against the gitolite-admin repo.
-///
-/// We shell out to `git` rather than use libgit2 because:
-///   - SSH agent / key file handling with libgit2 is painful.
-///   - `git` is always available in the container.
-///   - The operations are simple and infrequent.
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
 use anyhow::{bail, Context, Result};
 use tokio::process::Command;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::config::Config;
 
-/// A handle to the local checkout of the gitolite-admin repository.
 #[derive(Debug)]
 pub struct GitoliteAdmin {
     pub repo_path: PathBuf,
-    /// Path to the SSH private key used for push/pull.
     ssh_key: String,
-    /// SSH URL the repo was cloned from / is pushed to.
     remote_url: String,
-    /// gitolite hostname (for StrictHostKeyChecking workaround).
-    gitolite_host: String,
     gitolite_port: u16,
 }
 
 impl GitoliteAdmin {
-    /// Clone on first run; verify the checkout exists on subsequent starts.
     pub async fn init(config: &Config) -> Result<Self> {
         let repo_path = PathBuf::from(&config.admin_repo_path);
 
@@ -35,16 +24,17 @@ impl GitoliteAdmin {
             repo_path: repo_path.clone(),
             ssh_key: config.admin_ssh_key_path.clone(),
             remote_url: config.admin_repo_ssh_url.clone(),
-            gitolite_host: config.gitolite_host.clone(),
             gitolite_port: config.gitolite_port,
         };
 
         if repo_path.join(".git").exists() {
-            info!("gitolite-admin already cloned at {}", repo_path.display());
+            info!("[git] repo already exists at {} — fetching latest", repo_path.display());
             this.fetch().await?;
+            info!("[git] ✓ fetch + reset to origin/master complete");
         } else {
-            info!("Cloning gitolite-admin from {}", config.admin_repo_ssh_url);
+            info!("[git] no repo found — cloning from {}", config.admin_repo_ssh_url);
             this.clone_repo().await?;
+            info!("[git] ✓ clone complete");
         }
 
         Ok(this)
@@ -52,18 +42,16 @@ impl GitoliteAdmin {
 
     // ── Write helpers ────────────────────────────────────────────────────────
 
-    /// Overwrite `conf/gitolite.conf` with `content`.
     pub async fn write_gitolite_conf(&self, content: &str) -> Result<()> {
         let path = self.repo_path.join("conf/gitolite.conf");
         tokio::fs::create_dir_all(path.parent().unwrap()).await?;
         tokio::fs::write(&path, content)
             .await
             .context("write gitolite.conf")?;
-        debug!("Wrote conf/gitolite.conf ({} bytes)", content.len());
+        info!("[git] wrote conf/gitolite.conf ({} bytes)", content.len());
         Ok(())
     }
 
-    /// Write `content` to `kubeconfig/<workspace>.yaml`.
     pub async fn write_kubeconfig(&self, workspace: &str, content: &str) -> Result<()> {
         let dir = self.repo_path.join("kubeconfig");
         tokio::fs::create_dir_all(&dir).await?;
@@ -72,35 +60,42 @@ impl GitoliteAdmin {
         tokio::fs::write(&path, content)
             .await
             .context("write kubeconfig")?;
-        debug!("Wrote kubeconfig/{filename}.yaml ({} bytes)", content.len());
+        info!("[git] wrote kubeconfig/{filename}.yaml ({} bytes)", content.len());
         Ok(())
     }
 
     // ── Git operations ───────────────────────────────────────────────────────
 
-    /// Stage everything, commit (if there are changes), and push to gitolite.
     pub async fn commit_and_push(&self, message: &str) -> Result<()> {
+        info!("[git] staging all changes …");
         self.git(&["add", "-A"]).await?;
 
-        // Check if there's anything to commit
-        let status = self
-            .git_output(&["status", "--porcelain"])
-            .await?;
+        let status = self.git_output(&["status", "--porcelain"]).await?;
         if status.trim().is_empty() {
-            debug!("Nothing to commit, skipping push");
+            info!("[git] nothing to commit — working tree clean, skipping push");
             return Ok(());
         }
 
-        self.git(&["commit", "-m", message, "--author", "gitolite-sidecar <sidecar@local>"]).await?;
+        // Log what's actually changing
+        for line in status.trim().lines() {
+            info!("[git] staged: {line}");
+        }
 
-        info!("Pushing gitolite-admin…");
+        info!("[git] committing: \"{message}\" …");
+        self.git(&[
+            "commit", "-m", message,
+            "--author", "gitolite-sidecar <sidecar@local>",
+        ])
+        .await?;
+
+        info!("[git] pushing to origin/master …");
         self.git(&["push", "origin", "master"]).await?;
-        info!("Push complete");
+        info!("[git] ✓ push to gitolite complete");
         Ok(())
     }
 
-    /// Pull latest from remote (fast-forward only).
     pub async fn fetch(&self) -> Result<()> {
+        debug!("[git] fetching from origin …");
         self.git(&["fetch", "--prune", "origin"]).await?;
         self.git(&["reset", "--hard", "origin/master"]).await?;
         Ok(())
@@ -109,23 +104,26 @@ impl GitoliteAdmin {
     // ── Internal ─────────────────────────────────────────────────────────────
 
     async fn clone_repo(&self) -> Result<()> {
-        let mut cmd = Command::new("git");
-        cmd.args(["clone", &self.remote_url, self.repo_path.to_str().unwrap()])
+        let status = Command::new("git")
+            .args(["clone", &self.remote_url, self.repo_path.to_str().unwrap()])
             .env("GIT_SSH_COMMAND", self.ssh_command())
             .stdout(Stdio::inherit())
-            .stderr(Stdio::inherit());
-        let status = cmd.status().await.context("git clone")?;
+            .stderr(Stdio::inherit())
+            .status()
+            .await
+            .context("git clone")?;
+
         if !status.success() {
             bail!("git clone failed with {status}");
         }
 
-        // Set identity for commits
         self.git(&["config", "user.email", "sidecar@local"]).await?;
         self.git(&["config", "user.name", "gitolite-sidecar"]).await?;
         Ok(())
     }
 
     async fn git(&self, args: &[&str]) -> Result<()> {
+        debug!("[git] running: git {}", args.join(" "));
         let output = Command::new("git")
             .args(args)
             .current_dir(&self.repo_path)
@@ -136,7 +134,15 @@ impl GitoliteAdmin {
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            bail!("git {} failed: {stderr}", args.join(" "));
+            bail!("git {} failed:\n{stderr}", args.join(" "));
+        }
+
+        // Surface any git stderr at debug level (progress, remote messages)
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        for line in stderr.lines() {
+            if !line.trim().is_empty() {
+                debug!("[git remote] {line}");
+            }
         }
         Ok(())
     }
@@ -149,7 +155,6 @@ impl GitoliteAdmin {
             .output()
             .await
             .with_context(|| format!("git {}", args.join(" ")))?;
-
         Ok(String::from_utf8_lossy(&output.stdout).into_owned())
     }
 
@@ -161,34 +166,29 @@ impl GitoliteAdmin {
     }
 }
 
-// ── Utilities ────────────────────────────────────────────────────────────────
-
-/// Strip anything that isn't alphanumeric, `-`, or `_` to prevent path
-/// traversal in workspace names.
 fn sanitise_filename(name: &str) -> String {
     name.chars()
         .filter(|c| c.is_alphanumeric() || *c == '-' || *c == '_')
         .collect()
 }
 
-// ── Backup-specific helpers ──────────────────────────────────────────────────
+// ── Backup helpers ───────────────────────────────────────────────────────────
 
-/// List all repository names known to gitolite by reading
-/// `projects.list` from the gitolite data volume.
 pub async fn list_gitolite_repos(projects_list_path: &Path) -> Result<Vec<String>> {
+    info!("[backup] reading repo list from {}", projects_list_path.display());
     let content = tokio::fs::read_to_string(projects_list_path)
         .await
         .context("read projects.list")?;
-    Ok(content
+    let repos: Vec<String> = content
         .lines()
         .map(str::trim)
         .filter(|l| !l.is_empty())
         .map(String::from)
-        .collect())
+        .collect();
+    info!("[backup] found {} repos in projects.list", repos.len());
+    Ok(repos)
 }
 
-/// Clone `repo` from gitolite and push to the GitHub upstream, creating the
-/// remote repo via the GitHub API if it does not exist yet.
 pub async fn mirror_repo_to_github(
     repo: &str,
     gitolite_host: &str,
@@ -203,42 +203,40 @@ pub async fn mirror_repo_to_github(
     let clone_url = format!("ssh://git@{gitolite_host}:{gitolite_port}/{repo}");
     let mirror_dir = work_dir.join(repo.replace('/', "_"));
 
-    let ssh_cmd = format!(
+    let admin_ssh_cmd = format!(
         "ssh -i {admin_ssh_key} -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p {gitolite_port}"
     );
-
-    // --mirror clone (or fetch if already exists)
-    if mirror_dir.join("HEAD").exists() {
-        run_git(
-            &["remote", "update"],
-            &mirror_dir,
-            &ssh_cmd,
-        ).await?;
-    } else {
-        tokio::fs::create_dir_all(&mirror_dir).await?;
-        run_git_bare(
-            &["clone", "--mirror", &clone_url, mirror_dir.to_str().unwrap()],
-            work_dir,
-            &ssh_cmd,
-        ).await?;
-    }
-
-    // Ensure the GitHub repo exists (create via API if not)
-    ensure_github_repo(repo, gh_username, gh_pat).await?;
-
-    let push_url = format!("{gh_ssh_prefix}/{repo}.git");
     let gh_ssh_cmd = format!(
         "ssh -i {gh_ssh_key} -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
     );
 
-    // Push all refs
-    run_git(
-        &["push", "--mirror", &push_url],
-        &mirror_dir,
-        &gh_ssh_cmd,
-    ).await?;
+    // Clone or update mirror
+    if mirror_dir.join("HEAD").exists() {
+        info!("[backup] [{repo}] mirror exists — running remote update …");
+        run_git(&["remote", "update"], &mirror_dir, &admin_ssh_cmd).await?;
+        info!("[backup] [{repo}] ✓ remote update done");
+    } else {
+        info!("[backup] [{repo}] cloning --mirror from gitolite …");
+        tokio::fs::create_dir_all(&mirror_dir).await?;
+        run_git(
+            &["clone", "--mirror", &clone_url, mirror_dir.to_str().unwrap()],
+            work_dir,
+            &admin_ssh_cmd,
+        )
+        .await?;
+        info!("[backup] [{repo}] ✓ mirror clone done");
+    }
 
-    info!("Mirrored {repo} → {push_url}");
+    // Ensure GitHub repo exists
+    info!("[backup] [{repo}] ensuring GitHub repo exists …");
+    ensure_github_repo(repo, gh_username, gh_pat).await?;
+
+    // Push to GitHub
+    let push_url = format!("{gh_ssh_prefix}/{repo}.git");
+    info!("[backup] [{repo}] pushing --mirror to {push_url} …");
+    run_git(&["push", "--mirror", &push_url], &mirror_dir, &gh_ssh_cmd).await?;
+    info!("[backup] [{repo}] ✓ mirrored to GitHub");
+
     Ok(())
 }
 
@@ -254,11 +252,12 @@ async fn ensure_github_repo(repo: &str, username: &str, pat: &str) -> Result<()>
         .send()
         .await?;
 
-    if resp.status() == 200 {
-        return Ok(()); // already exists
+    if resp.status().as_u16() == 200 {
+        debug!("[backup] GitHub repo {owner}/{name} already exists");
+        return Ok(());
     }
 
-    // Create it
+    info!("[backup] GitHub repo {owner}/{name} not found — creating via API …");
     let create_url = if owner == username {
         "https://api.github.com/user/repos".to_string()
     } else {
@@ -266,33 +265,43 @@ async fn ensure_github_repo(repo: &str, username: &str, pat: &str) -> Result<()>
     };
 
     let body = serde_json::json!({ "name": name, "private": true });
-    client
+    let create_resp = client
         .post(&create_url)
         .header("Authorization", format!("token {pat}"))
         .header("User-Agent", "gitolite-sidecar")
         .json(&body)
         .send()
-        .await?
-        .error_for_status()?;
+        .await?;
 
-    info!("Created GitHub repo {owner}/{name}");
+    let status = create_resp.status();
+    if !status.is_success() {
+        let body = create_resp.text().await.unwrap_or_default();
+        bail!("GitHub API create repo failed ({status}): {body}");
+    }
+
+    info!("[backup] ✓ created GitHub repo {owner}/{name}");
     Ok(())
 }
 
 async fn run_git(args: &[&str], cwd: &Path, ssh_cmd: &str) -> Result<()> {
+    debug!("[git] git {} (cwd={})", args.join(" "), cwd.display());
     let output = Command::new("git")
         .args(args)
         .current_dir(cwd)
         .env("GIT_SSH_COMMAND", ssh_cmd)
         .output()
         .await?;
+
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        bail!("git {} failed: {stderr}", args.join(" "));
+        bail!("git {} failed:\n{stderr}", args.join(" "));
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    for line in stderr.lines() {
+        if !line.trim().is_empty() {
+            debug!("[git remote] {line}");
+        }
     }
     Ok(())
-}
-
-async fn run_git_bare(args: &[&str], cwd: &Path, ssh_cmd: &str) -> Result<()> {
-    run_git(args, cwd, ssh_cmd).await
 }

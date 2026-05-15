@@ -10,7 +10,7 @@ mod state;
 
 use anyhow::Result;
 use tokio_cron_scheduler::{Job, JobScheduler};
-use tracing::info;
+use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 
 use crate::config::Config;
@@ -23,50 +23,100 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::from_default_env()
-                .add_directive("gitolite_sidecar=info".parse()?),
+                .add_directive("gitolite_sidecar=debug".parse()?),
         )
+        .with_target(false)       // cleaner lines — no module path spam
+        .with_thread_ids(false)
         .init();
 
+    println!();
+    println!("╔══════════════════════════════════════════╗");
+    println!("║       gitolite-sidecar  v{}           ║", env!("CARGO_PKG_VERSION"));
+    println!("╚══════════════════════════════════════════╝");
+    println!();
+
     let config = Config::from_env()?;
-    info!("Starting gitolite-sidecar on :{}", config.port);
+
+    info!("──────────────────────────────────────────");
+    info!("  Config");
+    info!("    port          : {}", config.port);
+    info!("    debounce_secs : {}", config.debounce_secs);
+    info!("    gitolite host : {}:{}", config.gitolite_host, config.gitolite_port);
+    info!("    admin repo    : {}", config.admin_repo_path);
+    info!("    redis url     : {}", config.redis_url);
+    info!("    gh_username   : {}", config.gh_username);
+    info!("    gh_ssh_prefix : {}", config.gh_ssh_prefix);
+    info!("──────────────────────────────────────────");
 
     // ── Redis ─────────────────────────────────────────────────────────────────
+    info!("[redis] connecting to {} …", config.redis_url);
     let redis_client = redis::Client::open(config.redis_url.clone())?;
-    let redis_mgr = redis_client.get_connection_manager().await?;
-    info!("Connected to Redis at {}", config.redis_url);
+    let redis_mgr = match redis_client.get_connection_manager().await {
+        Ok(mgr) => {
+            info!("[redis] ✓ connected");
+            mgr
+        }
+        Err(e) => {
+            error!("[redis] ✗ failed to connect: {e:#}");
+            return Err(e.into());
+        }
+    };
 
     // ── gitolite-admin clone / verify ─────────────────────────────────────────
-    let admin_repo = GitoliteAdmin::init(&config).await?;
-    info!("gitolite-admin repo ready at {}", config.admin_repo_path);
+    info!("[git] initialising gitolite-admin repo …");
+    let admin_repo = match GitoliteAdmin::init(&config).await {
+        Ok(r) => {
+            info!("[git] ✓ repo ready at {}", config.admin_repo_path);
+            r
+        }
+        Err(e) => {
+            error!("[git] ✗ failed to init repo: {e:#}");
+            return Err(e);
+        }
+    };
 
     let state = AppState::new(config.clone(), admin_repo, redis_mgr);
 
     // ── Debounce push worker ──────────────────────────────────────────────────
+    info!("[debounce] starting push worker (window = {}s) …", config.debounce_secs);
     spawn_push_worker(state.clone());
+    info!("[debounce] ✓ push worker running");
 
     // ── Hourly backup cron ────────────────────────────────────────────────────
+    info!("[backup] registering hourly cron job …");
     let scheduler = JobScheduler::new().await?;
     let backup_state = state.clone();
     scheduler
         .add(Job::new_async("0 0 * * * *", move |_uuid, _lock| {
             let s = backup_state.clone();
             Box::pin(async move {
-                if let Err(e) = backup::run_backup(&s).await {
-                    tracing::error!("Backup job failed: {e:#}");
+                info!("[backup] ── cron tick: starting hourly backup ──");
+                match backup::run_backup(&s).await {
+                    Ok(_)  => info!("[backup] ✓ hourly backup complete"),
+                    Err(e) => error!("[backup] ✗ hourly backup failed: {e:#}"),
                 }
             })
         })?)
         .await?;
     scheduler.start().await?;
-    info!("Hourly backup scheduler started (cron: 0 0 * * * *)");
+    info!("[backup] ✓ cron registered (fires at :00 of every hour)");
 
     // ── HTTP server ───────────────────────────────────────────────────────────
-    // Swagger UI: http://<host>:<port>/swagger-ui/
-    // OpenAPI JSON: http://<host>:<port>/api-doc.json
+    println!();
+    info!("──────────────────────────────────────────");
+    info!("  Server listening");
+    info!("    http://0.0.0.0:{}", config.port);
+    info!("  Endpoints");
+    info!("    POST http://0.0.0.0:{}/permissions", config.port);
+    info!("    POST http://0.0.0.0:{}/kubeconfig", config.port);
+    info!("    GET  http://0.0.0.0:{}/healthz", config.port);
+    info!("    GET  http://0.0.0.0:{}/api-doc.json", config.port);
+    info!("    GET  http://0.0.0.0:{}/swagger-ui/", config.port);
+    info!("──────────────────────────────────────────");
+    println!();
+
     let routes = routes::build(state);
-    let port = config.port;
-    info!("Swagger UI available at http://0.0.0.0:{port}/swagger-ui/");
-    warp::serve(routes).run(([0, 0, 0, 0], port)).await;
+    warp::serve(routes).run(([0, 0, 0, 0], config.port)).await;
 
     Ok(())
 }
