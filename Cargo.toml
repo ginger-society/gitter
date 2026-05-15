@@ -17,6 +17,8 @@ thiserror = "1"
 uuid = { version = "1", features = ["v4"] }
 tokio-cron-scheduler = "0.10"
 reqwest = { version = "0.11", features = ["json"] }
+utoipa = {version = "2", features = ["json"]}
+utoipa-swagger-ui = "2.0"
 
 [profile.release]
 opt-level = 3

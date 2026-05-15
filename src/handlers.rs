@@ -1,46 +1,33 @@
 use std::convert::Infallible;
 
-use serde::{Deserialize, Serialize};
 use tracing::{error, info};
 use warp::http::StatusCode;
-use warp::reply::Json;
 
 use crate::redis_lock::{mark_dirty, signal_pending};
+use crate::requests::{ApiResponse, KubeconfigRequest, PermissionsRequest};
 use crate::state::AppState;
 
-// ── Request / response types ─────────────────────────────────────────────────
+// ── /permissions ─────────────────────────────────────────────────────────────
 
-/// POST /permissions
-#[derive(Deserialize)]
-pub struct PermissionsRequest {
-    /// Full contents of gitolite.conf — no validation, just write it.
-    pub conf: String,
-}
-
-/// POST /kubeconfig
-#[derive(Deserialize)]
-pub struct KubeconfigRequest {
-    /// Workspace name — used as the filename: kubeconfig/<workspace>.yaml
-    pub workspace: String,
-    /// Raw kubeconfig YAML content.
-    pub kubeconfig: String,
-}
-
-#[derive(Serialize)]
-struct ApiResponse {
-    status: &'static str,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    message: Option<String>,
-}
-
-// ── Handlers ─────────────────────────────────────────────────────────────────
-
-/// POST /permissions
+/// Update gitolite permissions
 ///
-/// Body: `{ "conf": "<full gitolite.conf content>" }`
-///
-/// Writes the content to the local gitolite-admin checkout and schedules a
-/// debounced push. Returns 202 Accepted immediately.
+/// Accepts a complete `gitolite.conf` file and writes it to the
+/// gitolite-admin repository. The push to gitolite is debounced — multiple
+/// calls within the debounce window are coalesced into a single commit.
+#[utoipa::path(
+    post,
+    path = "/permissions",
+    tag = "Admin",
+    request_body(
+        content = PermissionsRequest,
+        description = "Full gitolite.conf content",
+        content_type = "application/json"
+    ),
+    responses(
+        (status = 202, description = "Queued for push", body = ApiResponse),
+        (status = 500, description = "Internal error", body = ApiResponse),
+    )
+)]
 pub async fn handle_permissions(
     body: PermissionsRequest,
     state: AppState,
@@ -49,7 +36,6 @@ pub async fn handle_permissions(
 
     let repo = state.0.admin_repo.lock().await;
 
-    // 1. Write file
     if let Err(e) = repo.write_gitolite_conf(&body.conf).await {
         error!("Failed to write gitolite.conf: {e:#}");
         return Ok(warp::reply::with_status(
@@ -61,9 +47,8 @@ pub async fn handle_permissions(
         ));
     }
 
-    drop(repo); // release mutex before touching redis
+    drop(repo);
 
-    // 2. Mark dirty + reset debounce window
     let mut redis = state.0.redis.clone();
     if let Err(e) = mark_dirty(&mut redis).await {
         error!("Redis mark_dirty failed: {e:#}");
@@ -81,15 +66,29 @@ pub async fn handle_permissions(
     ))
 }
 
-/// POST /kubeconfig
+// ── /kubeconfig ──────────────────────────────────────────────────────────────
+
+/// Write a workspace kubeconfig
 ///
-/// Body: `{ "workspace": "my-workspace", "kubeconfig": "<yaml content>" }`
-///
-/// Writes to `kubeconfig/<workspace>.yaml` inside gitolite-admin and
-/// schedules a debounced push. Returns 202 Accepted immediately.
-///
-/// No GET endpoint is provided; kubeconfig content is write-only from this
-/// service's perspective.
+/// Writes the provided kubeconfig YAML to
+/// `kubeconfig/<workspace>.yaml` inside the gitolite-admin repository and
+/// schedules a debounced push. There is intentionally no GET endpoint —
+/// kubeconfig content is write-only through this service.
+#[utoipa::path(
+    post,
+    path = "/kubeconfig",
+    tag = "Admin",
+    request_body(
+        content = KubeconfigRequest,
+        description = "Workspace name and raw kubeconfig YAML",
+        content_type = "application/json"
+    ),
+    responses(
+        (status = 202, description = "Queued for push", body = ApiResponse),
+        (status = 400, description = "Bad request (empty workspace)", body = ApiResponse),
+        (status = 500, description = "Internal error", body = ApiResponse),
+    )
+)]
 pub async fn handle_kubeconfig(
     body: KubeconfigRequest,
     state: AppState,
@@ -100,7 +99,6 @@ pub async fn handle_kubeconfig(
         body.kubeconfig.len()
     );
 
-    // Basic validation: workspace must not be empty
     if body.workspace.trim().is_empty() {
         return Ok(warp::reply::with_status(
             warp::reply::json(&ApiResponse {
@@ -146,7 +144,20 @@ pub async fn handle_kubeconfig(
     ))
 }
 
-/// GET /healthz — liveness probe
+// ── /healthz ─────────────────────────────────────────────────────────────────
+
+/// Liveness probe
+///
+/// Returns 200 OK when the service is up. Used by Kubernetes liveness and
+/// readiness probes.
+#[utoipa::path(
+    get,
+    path = "/healthz",
+    tag = "Internal",
+    responses(
+        (status = 200, description = "Service is healthy", body = ApiResponse),
+    )
+)]
 pub async fn handle_health() -> Result<impl warp::Reply, Infallible> {
     Ok(warp::reply::with_status(
         warp::reply::json(&ApiResponse {
