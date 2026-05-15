@@ -65,3 +65,26 @@ pub struct ApiResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
 }
+
+/// POST /tekton-kubeconfig — write the shared Tekton kubeconfig to the repo root.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct UpdateTektonKubeconfigRequest {
+    /// Raw kubeconfig YAML content.
+    #[schema(example = "apiVersion: v1\nkind: Config\n...")]
+    pub kubeconfig: String,
+}
+
+
+/// POST /pipeline-token — write a workspace Ginger token.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct UpdatePipelineTokenRequest {
+    /// Workspace identifier — becomes the filename:
+    /// `pipeline-tokens/<workspace>`
+    /// Only alphanumeric characters, `-`, and `_` are allowed; others are stripped silently.
+    #[schema(example = "acme")]
+    pub workspace: String,
+
+    /// The raw GINGER_TOKEN value.
+    #[schema(example = "ginger_tok_abc123")]
+    pub token: String,
+}

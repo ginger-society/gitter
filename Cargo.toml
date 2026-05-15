@@ -19,6 +19,7 @@ tokio-cron-scheduler = "0.10"
 reqwest = { version = "0.11", default-features = false, features = ["json", "rustls-tls"] }
 utoipa = {version = "2", features = ["json"]}
 utoipa-swagger-ui = "2.0"
+base64 = "0.22"
 
 [profile.release]
 opt-level = 3

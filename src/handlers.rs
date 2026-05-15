@@ -6,7 +6,7 @@ use warp::http::StatusCode;
 use crate::permissions::{self, MemberType};
 use crate::redis_lock::{mark_dirty, signal_pending};
 use crate::requests::{
-    AddMemberRequest, ApiResponse, KubeconfigRequest, MemberTypeDto, RemoveMemberRequest,
+    AddMemberRequest, ApiResponse, KubeconfigRequest, MemberTypeDto, RemoveMemberRequest, UpdatePipelineTokenRequest, UpdateTektonKubeconfigRequest
 };
 use crate::state::AppState;
 
@@ -338,5 +338,147 @@ pub async fn handle_health() -> Result<impl warp::Reply, Infallible> {
     Ok(warp::reply::with_status(
         warp::reply::json(&ApiResponse { status: "ok", message: None }),
         StatusCode::OK,
+    ))
+}
+
+// ── POST /tekton-kubeconfig ──────────────────────────────────────────────────
+
+/// Write the shared Tekton kubeconfig
+///
+/// Writes the kubeconfig YAML to `kubeconfig.yaml` at the root of the
+/// gitolite-admin repository and schedules a debounced push.
+#[utoipa::path(
+    post,
+    path = "/tekton-kubeconfig",
+    tag = "Admin",
+    request_body(
+        content = UpdateTektonKubeconfigRequest,
+        description = "Raw kubeconfig YAML for Tekton",
+        content_type = "application/json"
+    ),
+    responses(
+        (status = 202, description = "Queued for push", body = ApiResponse),
+        (status = 400, description = "Validation error", body = ApiResponse),
+        (status = 500, description = "Internal error", body = ApiResponse),
+    )
+)]
+pub async fn handle_update_tekton_kubeconfig(
+    body: UpdateTektonKubeconfigRequest,
+    state: AppState,
+) -> Result<impl warp::Reply, Infallible> {
+    info!(
+        "POST /tekton-kubeconfig ({} bytes)",
+        body.kubeconfig.len()
+    );
+
+    if body.kubeconfig.trim().is_empty() {
+        return Ok(warp::reply::with_status(
+            warp::reply::json(&ApiResponse {
+                status: "error",
+                message: Some("kubeconfig must not be empty".into()),
+            }),
+            StatusCode::BAD_REQUEST,
+        ));
+    }
+
+    let repo = state.0.admin_repo.lock().await;
+    if let Err(e) = repo.write_tekton_kubeconfig(&body.kubeconfig).await {
+        error!("[git] write_tekton_kubeconfig failed: {e:#}");
+        return Ok(warp::reply::with_status(
+            warp::reply::json(&ApiResponse {
+                status: "error",
+                message: Some(e.to_string()),
+            }),
+            StatusCode::INTERNAL_SERVER_ERROR,
+        ));
+    }
+    drop(repo);
+
+    schedule_push(&state).await;
+
+    Ok(warp::reply::with_status(
+        warp::reply::json(&ApiResponse {
+            status: "accepted",
+            message: Some("tekton kubeconfig queued for push".into()),
+        }),
+        StatusCode::ACCEPTED,
+    ))
+}
+
+
+// ── POST /pipeline-token ─────────────────────────────────────────────────────
+
+/// Write a workspace pipeline token
+///
+/// Writes the GINGER_TOKEN value to `pipeline-tokens/<workspace>` inside the
+/// gitolite-admin repository (no file extension) and schedules a debounced push.
+#[utoipa::path(
+    post,
+    path = "/pipeline-token",
+    tag = "Admin",
+    request_body(
+        content = UpdatePipelineTokenRequest,
+        description = "Workspace and raw GINGER_TOKEN value",
+        content_type = "application/json"
+    ),
+    responses(
+        (status = 202, description = "Queued for push", body = ApiResponse),
+        (status = 400, description = "Validation error", body = ApiResponse),
+        (status = 500, description = "Internal error", body = ApiResponse),
+    )
+)]
+pub async fn handle_update_pipeline_token(
+    body: UpdatePipelineTokenRequest,
+    state: AppState,
+) -> Result<impl warp::Reply, Infallible> {
+    info!(
+        "POST /pipeline-token workspace={} ({} bytes)",
+        body.workspace,
+        body.token.len()
+    );
+
+    if body.workspace.trim().is_empty() {
+        return Ok(warp::reply::with_status(
+            warp::reply::json(&ApiResponse {
+                status: "error",
+                message: Some("workspace must not be empty".into()),
+            }),
+            StatusCode::BAD_REQUEST,
+        ));
+    }
+    if body.token.trim().is_empty() {
+        return Ok(warp::reply::with_status(
+            warp::reply::json(&ApiResponse {
+                status: "error",
+                message: Some("token must not be empty".into()),
+            }),
+            StatusCode::BAD_REQUEST,
+        ));
+    }
+
+    let repo = state.0.admin_repo.lock().await;
+    if let Err(e) = repo.write_pipeline_token(&body.workspace, &body.token).await {
+        error!("[git] write_pipeline_token failed: {e:#}");
+        return Ok(warp::reply::with_status(
+            warp::reply::json(&ApiResponse {
+                status: "error",
+                message: Some(e.to_string()),
+            }),
+            StatusCode::INTERNAL_SERVER_ERROR,
+        ));
+    }
+    drop(repo);
+
+    schedule_push(&state).await;
+
+    Ok(warp::reply::with_status(
+        warp::reply::json(&ApiResponse {
+            status: "accepted",
+            message: Some(format!(
+                "pipeline token for workspace '{}' queued for push",
+                body.workspace
+            )),
+        }),
+        StatusCode::ACCEPTED,
     ))
 }

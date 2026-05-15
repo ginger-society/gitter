@@ -153,6 +153,27 @@ impl GitoliteAdmin {
         Ok(())
     }
 
+    pub async fn write_pipeline_token(&self, workspace: &str, token: &str) -> Result<()> {
+        let ws = sanitise_filename(workspace);
+        let dir = self.repo_path.join("pipeline-tokens");
+        tokio::fs::create_dir_all(&dir).await?;
+        let path = dir.join(&ws);
+        tokio::fs::write(&path, token)
+            .await
+            .context("write pipeline token")?;
+        info!("[git] wrote pipeline-tokens/{ws} ({} bytes)", token.len());
+        Ok(())
+    }
+
+    pub async fn write_tekton_kubeconfig(&self, content: &str) -> Result<()> {
+        let path = self.repo_path.join("kubeconfig.yaml");
+        tokio::fs::write(&path, content)
+            .await
+            .context("write tekton kubeconfig")?;
+        info!("[git] wrote kubeconfig.yaml ({} bytes)", content.len());
+        Ok(())
+    }
+
     async fn git_output(&self, args: &[&str]) -> Result<String> {
         let output = Command::new("git")
             .args(args)
@@ -435,6 +456,8 @@ async fn ensure_github_repo(repo: &str, username: &str, pat: &str) -> Result<()>
     Ok(())
 }
 
+
+
 async fn run_git(args: &[&str], cwd: &Path, ssh_cmd: &str) -> Result<()> {
     debug!("[git] git {} (cwd={})", args.join(" "), cwd.display());
     let output = Command::new("git")
@@ -457,3 +480,4 @@ async fn run_git(args: &[&str], cwd: &Path, ssh_cmd: &str) -> Result<()> {
     }
     Ok(())
 }
+

@@ -6,11 +6,11 @@ use warp::Filter;
 
 use crate::handlers::{
     __path_handle_add_member, __path_handle_health,
-    __path_handle_kubeconfig, __path_handle_remove_member,
-    handle_add_member, handle_health, handle_kubeconfig, handle_remove_member,
+    __path_handle_kubeconfig, __path_handle_remove_member, __path_handle_update_tekton_kubeconfig, __path_handle_update_pipeline_token,
+    handle_add_member, handle_health, handle_kubeconfig, handle_remove_member, handle_update_tekton_kubeconfig, handle_update_pipeline_token
 };
 use crate::requests::{
-    AddMemberRequest, ApiResponse, KubeconfigRequest, MemberTypeDto, RemoveMemberRequest,
+    AddMemberRequest, ApiResponse, KubeconfigRequest, MemberTypeDto, RemoveMemberRequest, UpdatePipelineTokenRequest, UpdateTektonKubeconfigRequest
 };
 use crate::state::AppState;
 
@@ -23,6 +23,8 @@ use crate::state::AppState;
         handle_remove_member,
         handle_kubeconfig,
         handle_health,
+        handle_update_tekton_kubeconfig,
+        handle_update_pipeline_token
     ),
     components(
         schemas(
@@ -31,6 +33,8 @@ use crate::state::AppState;
             MemberTypeDto,
             KubeconfigRequest,
             ApiResponse,
+            UpdateTektonKubeconfigRequest,
+            UpdatePipelineTokenRequest
         )
     ),
     tags(
@@ -86,6 +90,24 @@ pub fn build(
         .and(with_state(state.clone()))
         .and_then(handle_kubeconfig);
 
+    // POST /tekton-kubeconfig
+    let tekton_kubeconfig = warp::post()
+        .and(warp::path("tekton-kubeconfig"))
+        .and(warp::path::end())
+        .and(warp::body::content_length_limit(1024 * 1024))
+        .and(warp::body::json())
+        .and(with_state(state.clone()))
+        .and_then(handle_update_tekton_kubeconfig);
+
+    // POST /pipeline-token
+    let pipeline_token = warp::post()
+        .and(warp::path("pipeline-token"))
+        .and(warp::path::end())
+        .and(warp::body::content_length_limit(64 * 1024))
+        .and(warp::body::json())
+        .and(with_state(state.clone()))
+        .and_then(handle_update_pipeline_token);
+
     // GET /healthz
     let health = warp::get()
         .and(warp::path("healthz"))
@@ -111,6 +133,8 @@ pub fn build(
     add_member
         .or(remove_member)
         .or(kubeconfig)
+        .or(tekton_kubeconfig)
+        .or(pipeline_token)
         .or(health)
         .or(api_doc)
         .or(swagger_ui)
