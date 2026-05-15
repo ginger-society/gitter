@@ -1,14 +1,37 @@
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
-/// POST /permissions — full gitolite.conf replacement.
+/// Member type for workspace permission endpoints.
+#[derive(Debug, Deserialize, Serialize, ToSchema, PartialEq, Eq, Clone)]
+#[serde(rename_all = "lowercase")]
+pub enum MemberTypeDto {
+    /// A human user identified by their username (e.g. `vriksh`).
+    User,
+    /// An agent or API server identified by a UUID
+    /// (e.g. `435a8c5a-da91-4b95-8364-40ca23cb1109`).
+    Group,
+}
+
+/// POST /workspace/:workspace/member — add a user or group to a workspace.
 #[derive(Debug, Deserialize, ToSchema)]
-pub struct PermissionsRequest {
-    /// Complete contents of gitolite.conf.
-    /// The sidecar writes this verbatim to conf/gitolite.conf in the
-    /// gitolite-admin repo and schedules a debounced push.
-    #[schema(example = "repo gitolite-admin\n    RW+ = @all\n\nrepo testing\n    RW+ = @all\n")]
-    pub conf: String,
+pub struct AddMemberRequest {
+    /// Whether this is a human `user` or an agent `group`.
+    pub r#type: MemberTypeDto,
+
+    /// The identifier: a username for users, a UUID for groups.
+    #[schema(example = "vriksh")]
+    pub name: String,
+}
+
+/// DELETE /workspace/:workspace/member — remove a user or group.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct RemoveMemberRequest {
+    /// Whether this is a human `user` or an agent `group`.
+    pub r#type: MemberTypeDto,
+
+    /// The identifier to remove.
+    #[schema(example = "vriksh")]
+    pub name: String,
 }
 
 /// POST /kubeconfig — write a workspace+environment kubeconfig file.

@@ -2,6 +2,7 @@ user_key*
 signing-keys/ca_key
 admin_key*
 admin-repo
+test-repo
 
 # Added by cargo
 

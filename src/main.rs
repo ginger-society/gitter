@@ -7,6 +7,7 @@ mod redis_lock;
 mod requests;
 mod routes;
 mod state;
+mod permissions;
 
 use anyhow::Result;
 use tokio_cron_scheduler::{Job, JobScheduler};

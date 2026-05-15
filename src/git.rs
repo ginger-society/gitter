@@ -275,32 +275,62 @@ pub async fn mirror_repo_to_github(
         "ssh -i {gh_ssh_key} -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
     );
 
-    // Clone or update mirror
-    if mirror_dir.join("HEAD").exists() {
-        info!("[backup] [{repo}] mirror exists — running remote update …");
-        run_git(&["remote", "update"], &mirror_dir, &admin_ssh_cmd).await?;
-        info!("[backup] [{repo}] ✓ remote update done");
+    // We use a plain (non-mirror) clone so we can push only main/master.
+    // A --mirror clone would push every branch including personal dev-* branches
+    // which would bloat the backup and leak branch names.
+    if mirror_dir.join(".git").exists() {
+        info!("[backup] [{repo}] local clone exists — fetching all refs …");
+        run_git(&["fetch", "--prune", "origin"], &mirror_dir, &admin_ssh_cmd).await?;
+        info!("[backup] [{repo}] ✓ fetch done");
     } else {
-        info!("[backup] [{repo}] cloning --mirror from gitolite …");
+        info!("[backup] [{repo}] cloning from gitolite (no-checkout) …");
         tokio::fs::create_dir_all(&mirror_dir).await?;
         run_git(
-            &["clone", "--mirror", &clone_url, mirror_dir.to_str().unwrap()],
+            &["clone", "--no-checkout", &clone_url, mirror_dir.to_str().unwrap()],
             work_dir,
             &admin_ssh_cmd,
         )
         .await?;
-        info!("[backup] [{repo}] ✓ mirror clone done");
+        info!("[backup] [{repo}] ✓ clone done");
     }
 
     // Ensure GitHub repo exists
     info!("[backup] [{repo}] ensuring GitHub repo exists …");
     ensure_github_repo(repo, gh_username, gh_pat).await?;
 
-    // Push to GitHub
+    // Push only main and master — never dev-* or other personal branches.
+    // We push each refspec explicitly so missing branches are silently skipped.
     let push_url = format!("{gh_ssh_prefix}/{repo}.git");
-    info!("[backup] [{repo}] pushing --mirror to {push_url} …");
-    run_git(&["push", "--mirror", &push_url], &mirror_dir, &gh_ssh_cmd).await?;
-    info!("[backup] [{repo}] ✓ mirrored to GitHub");
+    info!("[backup] [{repo}] pushing main + master to {push_url} …");
+
+    let mut pushed_any = false;
+    for branch in &["main", "master"] {
+        // Check whether this branch exists in the local clone
+        let check = tokio::process::Command::new("git")
+            .args(["rev-parse", "--verify", &format!("origin/{branch}")])
+            .current_dir(&mirror_dir)
+            .output()
+            .await?;
+
+        if check.status.success() {
+            let refspec = format!("refs/remotes/origin/{branch}:refs/heads/{branch}");
+            match run_git(&["push", &push_url, &refspec], &mirror_dir, &gh_ssh_cmd).await {
+                Ok(_) => {
+                    info!("[backup] [{repo}] ✓ pushed {branch}");
+                    pushed_any = true;
+                }
+                Err(e) => warn!("[backup] [{repo}] push {branch} failed: {e:#}"),
+            }
+        } else {
+            debug!("[backup] [{repo}] branch {branch} not found — skipping");
+        }
+    }
+
+    if pushed_any {
+        info!("[backup] [{repo}] ✓ backup to GitHub complete");
+    } else {
+        warn!("[backup] [{repo}] no main or master branch found — nothing pushed");
+    }
 
     Ok(())
 }
