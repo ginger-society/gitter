@@ -52,15 +52,21 @@ impl GitoliteAdmin {
         Ok(())
     }
 
-    pub async fn write_kubeconfig(&self, workspace: &str, content: &str) -> Result<()> {
-        let dir = self.repo_path.join("kubeconfig");
+    pub async fn write_kubeconfig(
+        &self,
+        workspace: &str,
+        environment: &str,
+        content: &str,
+    ) -> Result<()> {
+        let ws  = sanitise_filename(workspace);
+        let env = sanitise_filename(environment);
+        let dir = self.repo_path.join("kubeconfig").join(&ws);
         tokio::fs::create_dir_all(&dir).await?;
-        let filename = sanitise_filename(workspace);
-        let path = dir.join(format!("{filename}.yaml"));
+        let path = dir.join(format!("{env}.yaml"));
         tokio::fs::write(&path, content)
             .await
             .context("write kubeconfig")?;
-        info!("[git] wrote kubeconfig/{filename}.yaml ({} bytes)", content.len());
+        info!("[git] wrote kubeconfig/{ws}/{env}.yaml ({} bytes)", content.len());
         Ok(())
     }
 

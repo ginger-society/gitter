@@ -11,15 +11,22 @@ pub struct PermissionsRequest {
     pub conf: String,
 }
 
-/// POST /kubeconfig — write a workspace kubeconfig file.
+/// POST /kubeconfig — write a workspace+environment kubeconfig file.
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct KubeconfigRequest {
-    /// Workspace identifier. Used as the filename:
-    /// `kubeconfig/<workspace>.yaml` inside gitolite-admin.
+    /// Workspace identifier — becomes the directory name:
+    /// `kubeconfig/<workspace>/<environment>.yaml`.
     /// Only alphanumeric characters, `-`, and `_` are allowed; others are
     /// stripped silently.
-    #[schema(example = "staging-eu-west")]
+    #[schema(example = "my-workspace")]
     pub workspace: String,
+
+    /// Environment name — becomes the filename inside the workspace directory.
+    /// E.g. `production`, `staging`, `dev`.
+    /// Only alphanumeric characters, `-`, and `_` are allowed; others are
+    /// stripped silently.
+    #[schema(example = "production")]
+    pub environment: String,
 
     /// Raw kubeconfig YAML content.
     #[schema(example = "apiVersion: v1\nkind: Config\n...")]

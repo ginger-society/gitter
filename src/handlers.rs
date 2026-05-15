@@ -94,8 +94,9 @@ pub async fn handle_kubeconfig(
     state: AppState,
 ) -> Result<impl warp::Reply, Infallible> {
     info!(
-        "POST /kubeconfig workspace={} ({} bytes)",
+        "POST /kubeconfig workspace={} environment={} ({} bytes)",
         body.workspace,
+        body.environment,
         body.kubeconfig.len()
     );
 
@@ -109,9 +110,19 @@ pub async fn handle_kubeconfig(
         ));
     }
 
+    if body.environment.trim().is_empty() {
+        return Ok(warp::reply::with_status(
+            warp::reply::json(&ApiResponse {
+                status: "error",
+                message: Some("environment must not be empty".into()),
+            }),
+            StatusCode::BAD_REQUEST,
+        ));
+    }
+
     let repo = state.0.admin_repo.lock().await;
 
-    if let Err(e) = repo.write_kubeconfig(&body.workspace, &body.kubeconfig).await {
+    if let Err(e) = repo.write_kubeconfig(&body.workspace, &body.environment, &body.kubeconfig).await {
         error!("Failed to write kubeconfig: {e:#}");
         return Ok(warp::reply::with_status(
             warp::reply::json(&ApiResponse {
@@ -136,8 +147,8 @@ pub async fn handle_kubeconfig(
         warp::reply::json(&ApiResponse {
             status: "accepted",
             message: Some(format!(
-                "kubeconfig for workspace '{}' queued for push",
-                body.workspace
+                "kubeconfig for workspace '{}' env '{}' queued for push",
+                body.workspace, body.environment
             )),
         }),
         StatusCode::ACCEPTED,
