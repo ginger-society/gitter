@@ -47,6 +47,10 @@ pub async fn run_backup(state: &AppState) -> Result<()> {
     let mut failure = 0usize;
 
     for (i, repo) in repos.iter().enumerate() {
+        if repo.ends_with(".*") {
+            info!("[backup] [{}/{total}] skipping wildcard repo '{repo}'", i + 1);
+            continue;
+        }
         info!("[backup] [{}/{total}] mirroring '{repo}' …", i + 1);
         match mirror_repo_to_github(
             repo,

@@ -254,6 +254,7 @@ pub async fn list_gitolite_repos(
     Ok(repos)
 }
 
+
 pub async fn mirror_repo_to_github(
     repo: &str,
     gitolite_host: &str,
@@ -266,7 +267,9 @@ pub async fn mirror_repo_to_github(
     work_dir: &Path,
 ) -> Result<()> {
     let clone_url = format!("ssh://git@{gitolite_host}:{gitolite_port}/{repo}");
-    let mirror_dir = work_dir.join(repo.replace('/', "_"));
+    let safe_name  = repo.replace('/', "_");
+    let source_dir = work_dir.join(format!("{safe_name}__source"));   // raw gitolite clone
+    let rewrite_dir = work_dir.join(format!("{safe_name}__rewrite")); // filter-repo output
 
     let admin_ssh_cmd = format!(
         "ssh -i {admin_ssh_key} -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p {gitolite_port}"
@@ -275,46 +278,86 @@ pub async fn mirror_repo_to_github(
         "ssh -i {gh_ssh_key} -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
     );
 
-    // We use a plain (non-mirror) clone so we can push only main/master.
-    // A --mirror clone would push every branch including personal dev-* branches
-    // which would bloat the backup and leak branch names.
-    if mirror_dir.join(".git").exists() {
-        info!("[backup] [{repo}] local clone exists — fetching all refs …");
-        run_git(&["fetch", "--prune", "origin"], &mirror_dir, &admin_ssh_cmd).await?;
+    // ── 1. Keep source_dir in sync with gitolite ──────────────────────────────
+    if source_dir.join(".git").exists() {
+        info!("[backup] [{repo}] fetching latest from gitolite …");
+        run_git(&["fetch", "--prune", "origin"], &source_dir, &admin_ssh_cmd).await?;
         info!("[backup] [{repo}] ✓ fetch done");
     } else {
-        info!("[backup] [{repo}] cloning from gitolite (no-checkout) …");
-        tokio::fs::create_dir_all(&mirror_dir).await?;
+        info!("[backup] [{repo}] cloning from gitolite …");
+        tokio::fs::create_dir_all(&source_dir).await?;
         run_git(
-            &["clone", "--no-checkout", &clone_url, mirror_dir.to_str().unwrap()],
+            &["clone", "--no-checkout", &clone_url, source_dir.to_str().unwrap()],
             work_dir,
             &admin_ssh_cmd,
-        )
-        .await?;
+        ).await?;
         info!("[backup] [{repo}] ✓ clone done");
     }
 
-    // Ensure GitHub repo exists
+    // ── 2. Always blow away rewrite_dir and rebuild from source ──────────────
+    // filter-repo rewrites SHAs deterministically (same source + same filter =
+    // same SHA) so the push to GitHub will be a no-op when nothing changed.
+    if rewrite_dir.exists() {
+        tokio::fs::remove_dir_all(&rewrite_dir).await?;
+    }
+    // Copy source into rewrite_dir — filter-repo operates in-place
+    run_cmd("cp", &["-r", source_dir.to_str().unwrap(), rewrite_dir.to_str().unwrap()]).await?;
+
+    info!("[backup] [{repo}] rewriting commit authors via git-filter-repo …");
+    let filter_status = tokio::process::Command::new("git")
+        .args([
+            "filter-repo",
+            "--force",
+            "--partial",  
+            "--email-callback", "return b\"admin@domain.org\"",
+            "--name-callback",  "return b\"Admin\"",
+        ])
+        .current_dir(&rewrite_dir)
+        .output()
+        .await
+        .context("git filter-repo")?;
+
+    if !filter_status.status.success() {
+        let stderr = String::from_utf8_lossy(&filter_status.stderr);
+        bail!("git filter-repo failed:\n{stderr}");
+    }
+
+    let stderr = String::from_utf8_lossy(&filter_status.stderr);
+    for line in stderr.lines() {
+        info!("[backup] [{repo}] filter-repo: {line}");
+    }
+
+    info!("[backup] [{repo}] ✓ author rewrite done");
+
+    // DEBUG: log all refs in rewrite_dir to see what filter-repo left behind
+    let refs_output = tokio::process::Command::new("git")
+        .args(["show-ref"])
+        .current_dir(&rewrite_dir)
+        .output()
+        .await?;
+    let refs_str = String::from_utf8_lossy(&refs_output.stdout);
+    for line in refs_str.lines() {
+        info!("[backup] [{repo}] ref: {line}");
+    }
+
+    // ── 3. Push rewritten branches to GitHub ─────────────────────────────────
     info!("[backup] [{repo}] ensuring GitHub repo exists …");
     ensure_github_repo(repo, gh_username, gh_pat).await?;
 
-    // Push only main and master — never dev-* or other personal branches.
-    // We push each refspec explicitly so missing branches are silently skipped.
     let push_url = format!("{gh_ssh_prefix}/{repo}.git");
     info!("[backup] [{repo}] pushing main + master to {push_url} …");
 
     let mut pushed_any = false;
     for branch in &["main", "master"] {
-        // Check whether this branch exists in the local clone
         let check = tokio::process::Command::new("git")
-            .args(["rev-parse", "--verify", &format!("origin/{branch}")])
-            .current_dir(&mirror_dir)
+            .args(["rev-parse", "--verify", &format!("refs/heads/{branch}")])  // ← fix here
+            .current_dir(&rewrite_dir)
             .output()
             .await?;
 
         if check.status.success() {
-            let refspec = format!("refs/remotes/origin/{branch}:refs/heads/{branch}");
-            match run_git(&["push", &push_url, &refspec], &mirror_dir, &gh_ssh_cmd).await {
+            let refspec = format!("refs/heads/{branch}:refs/heads/{branch}");
+            match run_git(&["push", "--force", &push_url, &refspec], &rewrite_dir, &gh_ssh_cmd).await {
                 Ok(_) => {
                     info!("[backup] [{repo}] ✓ pushed {branch}");
                     pushed_any = true;
@@ -332,6 +375,20 @@ pub async fn mirror_repo_to_github(
         warn!("[backup] [{repo}] no main or master branch found — nothing pushed");
     }
 
+    Ok(())
+}
+
+// helper for non-git shell commands
+async fn run_cmd(program: &str, args: &[&str]) -> Result<()> {
+    let output = tokio::process::Command::new(program)
+        .args(args)
+        .output()
+        .await
+        .with_context(|| format!("{program} {}", args.join(" ")))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("{program} {} failed:\n{stderr}", args.join(" "));
+    }
     Ok(())
 }
 
