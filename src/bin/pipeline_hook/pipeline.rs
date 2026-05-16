@@ -6,7 +6,8 @@ use crate::pipeline_hook::gitops::{
     resolve_workspace,
 };
 use crate::pipeline_hook::kubectl::{
-    create_pipeline_run, ensure_ginger_token_secret, ensure_namespace, ensure_pvcs, kubectl_apply,
+    create_pipeline_run, ensure_deployment_target_secret, ensure_ginger_token_secret,
+    ensure_namespace, ensure_pvcs, kubectl_apply,
 };
 use crate::pipeline_hook::types::{PipelineDefinition, PipelineRunContext};
 use crate::pipeline_hook::yaml::{parse_pipeline_yaml, should_trigger};
@@ -94,7 +95,11 @@ pub fn run(
         println!("[ginger-gitter]   {} (concurrency: {})", p.name, p.concurrency);
     }
 
-    // ── 8. Resolve per-workspace kubeconfig ───────────────────────────────────
+    // ── 8. Resolve per-workspace kubeconfig (optional) ───────────────────────
+    // A missing kubeconfig is non-fatal — the build/test pipeline runs fine
+    // without a deployment target. The kubeconfig is only needed if a pipeline
+    // task actually deploys somewhere. We pass None and let individual tasks
+    // decide whether they need it.
     let workspace_kubeconfig_key = if is_main {
         format!("kubeconfig/{}/staging.yaml", workspace)
     } else {
@@ -105,17 +110,17 @@ pub fn run(
         workspace_kubeconfig_key
     );
 
-    let workspace_kubeconfig = match read_from_admin_repo(admin_git_dir, &workspace_kubeconfig_key) {
+    let workspace_kubeconfig: Option<String> = match read_from_admin_repo(admin_git_dir, &workspace_kubeconfig_key) {
         Ok(kc) => {
-            println!("[ginger-gitter] ✓ Workspace kubeconfig found");
-            // TODO: Here we will inject this kubeconfig as-is into the PipelineRun context and let the tasks use it for patching the image tag and restart the deployement.
-            kc
+            println!("[ginger-gitter] ✓ Workspace kubeconfig found ({} bytes)", kc.len());
+            Some(kc)
         }
-        Err(e) => {
-            return Err(format!(
-                "kubeconfig not found for key '{}': {} — has the environment been provisioned?",
-                workspace_kubeconfig_key, e
-            ));
+        Err(_) => {
+            println!(
+                "[ginger-gitter] ⚠ No workspace kubeconfig found for '{}' —                  pipeline will run but deployment steps (if any) will have no target",
+                workspace_kubeconfig_key
+            );
+            None
         }
     };
 
@@ -151,18 +156,19 @@ pub fn run(
     };
 
     println!("[ginger-gitter] Pipeline run context:");
-    println!("[ginger-gitter]   workspace    : {}", context.workspace);
-    println!("[ginger-gitter]   branch       : {}", context.gl_branch);
-    println!("[ginger-gitter]   new_rev      : {}", context.gl_new_rev);
-    println!("[ginger-gitter]   changed_files: {}", context.gl_changed_files.len());
+    println!("[ginger-gitter]   workspace      : {}", context.workspace);
+    println!("[ginger-gitter]   branch         : {}", context.gl_branch);
+    println!("[ginger-gitter]   new_rev        : {}", context.gl_new_rev);
+    println!("[ginger-gitter]   changed_files  : {}", context.gl_changed_files.len());
+    println!("[ginger-gitter]   deploy target  : {}",
+        if context.kubeconfig.is_some() { "✓ kubeconfig present" } else { "⚠ none (build only)" }
+    );
 
     // ── 12. Trigger each matched pipeline ─────────────────────────────────────
-    // Namespace follows the project convention: tasks-<workspace>-<repo>.
-    // The user's pipeline YAML intentionally omits it; we own it here so
-    // there is exactly one source of truth and no parsing ambiguity.
+    // Namespace convention: tasks-<repo> (no workspace prefix — the repo name
+    // already carries the workspace, e.g. "rackmint-provisioner-service").
     let namespace = format!(
-        "tasks-{}-{}",
-        workspace,
+        "tasks-{}",
         gl_repo.replace('/', "-").replace('_', "-")
     );
     println!("[ginger-gitter] Target namespace: {}", namespace);
@@ -216,7 +222,26 @@ fn trigger_pipeline(
     ensure_ginger_token_secret(tekton_kubeconfig, namespace, &ctx.ginger_token)
         .map_err(|e| format!("failed to ensure ginger-token-secret: {}", e))?;
 
-    // ── 12d. Apply built-in tasks (init-credentials, clone) ──────────────────
+    // ── 12d. Ensure deployment-target secret (branch-scoped) ─────────────────
+    // Named deployment-target-<branch> so concurrent pipelines on different
+    // branches never collide. No-op when no kubeconfig is available yet.
+    let deployment_target_secret_name = format!(
+        "deployment-target-{}",
+        sanitize_secret_name(&ctx.gl_branch)
+    );
+    println!(
+        "[ginger-gitter] Ensuring deployment target secret: {}",
+        deployment_target_secret_name
+    );
+    ensure_deployment_target_secret(
+        tekton_kubeconfig,
+        namespace,
+        &deployment_target_secret_name,
+        &ctx.kubeconfig,
+    )
+    .map_err(|e| format!("failed to ensure deployment target secret: {}", e))?;
+
+    // ── 12e. Apply built-in tasks (init-credentials, clone) ──────────────────
     println!("[ginger-gitter] Applying built-in tasks …");
     let init_creds_yaml = builtin_init_credentials_task(namespace);
     kubectl_apply(tekton_kubeconfig, &init_creds_yaml)
@@ -228,7 +253,7 @@ fn trigger_pipeline(
         .map_err(|e| format!("failed to apply clone task: {}", e))?;
     println!("[ginger-gitter] ✓ clone task applied");
 
-    // ── 12e. Apply user-defined tasks from .tekton/tasks/ ────────────────────
+    // ── 12f. Apply user-defined tasks from .tekton/tasks/ ────────────────────
     let task_files: Vec<&String> = tekton_files
         .iter()
         .filter(|f| {
@@ -259,7 +284,7 @@ fn trigger_pipeline(
         }
     }
 
-    // ── 12f. Apply pipeline from source file ──────────────────────────────────
+    // ── 12g. Apply pipeline from source file ──────────────────────────────────
     println!("[ginger-gitter] Applying pipeline: {}", pipeline.source_file);
     let pipeline_raw = read_file_from_commit(repo_path, new_rev, &pipeline.source_file)
         .map_err(|e| format!("failed to read pipeline file {}: {}", pipeline.source_file, e))?;
@@ -271,12 +296,12 @@ fn trigger_pipeline(
         .map_err(|e| format!("failed to apply pipeline {}: {}", pipeline.name, e))?;
     println!("[ginger-gitter] ✓ Pipeline applied: {}", pipeline.name);
 
-    // ── 12g. Handle concurrency: cancel-previous ──────────────────────────────
+    // ── 12h. Handle concurrency: cancel-previous ──────────────────────────────
     if pipeline.concurrency == "cancel-previous" {
         cancel_running_pipeline_runs(tekton_kubeconfig, namespace, &pipeline.pipeline_name, ctx)?;
     }
 
-    // ── 12h. Create PipelineRun ───────────────────────────────────────────────
+    // ── 12i. Create PipelineRun ────────────────────────────────────────────────
     // Build user params from pipeline params (empty map — pipeline uses its defaults;
     // callers can extend this with annotation-driven params in the future)
     let user_params: HashMap<String, String> = HashMap::new();
@@ -289,6 +314,7 @@ fn trigger_pipeline(
         &ctx.gl_repo,
         &ctx.gl_refname,
         &ctx.gl_new_rev,
+        &deployment_target_secret_name,
     );
 
     println!("[ginger-gitter] Creating PipelineRun for: {}", pipeline.pipeline_name);
@@ -427,4 +453,22 @@ fn parse_pipeline_files(
         }
     }
     Ok(pipelines)
+}
+
+/// Sanitize a branch name for use in a Kubernetes secret name.
+/// Secret names must be DNS subdomains: lowercase alphanumeric and '-', max 253 chars.
+fn sanitize_secret_name(branch: &str) -> String {
+    let lowered = branch.to_lowercase();
+    let cleaned: String = lowered
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '-' })
+        .collect();
+    // Collapse consecutive dashes, trim leading/trailing dashes
+    let collapsed = cleaned
+        .split('-')
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join("-");
+    // Truncate to 253 chars (leaving room for "deployment-target-" prefix = 18 chars)
+    collapsed[..235.min(collapsed.len())].to_string()
 }

@@ -3,6 +3,25 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::process::Command;
 
+/// Locate the kubectl binary. Git hooks run with a minimal PATH so we probe
+/// common install locations explicitly before falling back to a PATH lookup.
+fn find_kubectl() -> PathBuf {
+    const CANDIDATES: &[&str] = &[
+        "/usr/local/bin/kubectl",
+        "/usr/bin/kubectl",
+        "/bin/kubectl",
+        "/snap/bin/kubectl",
+        "/opt/homebrew/bin/kubectl",
+    ];
+    for path in CANDIDATES {
+        if std::path::Path::new(path).exists() {
+            return PathBuf::from(path);
+        }
+    }
+    // Last resort: rely on PATH (will produce os error 2 if truly missing)
+    PathBuf::from("kubectl")
+}
+
 /// Write kubeconfig to a temp file, run kubectl with it, then clean up.
 /// Returns stdout on success, Err with stderr on failure.
 pub fn kubectl_apply(kubeconfig_yaml: &str, resource_yaml: &str) -> Result<String, String> {
@@ -93,6 +112,57 @@ data:
     })
 }
 
+/// Ensure a deployment-target kubeconfig Secret exists in the namespace.
+/// Named after the branch so concurrent pipelines on different branches
+/// never clash: deployment-target-dev-alice, deployment-target-main, etc.
+/// Safe to call on every push — overwrites with the latest kubeconfig.
+/// When kubeconfig is None (no environment provisioned yet) this is a no-op.
+pub fn ensure_deployment_target_secret(
+    tekton_kubeconfig: &str,
+    namespace: &str,
+    secret_name: &str,
+    deployment_kubeconfig: &Option<String>,
+) -> Result<(), String> {
+    let kc = match deployment_kubeconfig {
+        Some(kc) => kc,
+        None => {
+            println!(
+                "[ginger-gitter] No deployment target kubeconfig — skipping secret '{}'",
+                secret_name
+            );
+            return Ok(());
+        }
+    };
+
+    use base64::{engine::general_purpose::STANDARD, Engine};
+    let kc_b64 = STANDARD.encode(kc.as_bytes());
+
+    let secret_yaml = format!(
+        r#"apiVersion: v1
+kind: Secret
+metadata:
+  name: {secret_name}
+  namespace: {namespace}
+  labels:
+    ginger-gitter/secret-type: deployment-target
+type: Opaque
+data:
+  kubeconfig.yaml: {kc_b64}
+"#,
+        secret_name = secret_name,
+        namespace = namespace,
+        kc_b64 = kc_b64,
+    );
+
+    kubectl_apply(tekton_kubeconfig, &secret_yaml).map(|out| {
+        println!(
+            "[ginger-gitter] ✓ Deployment target secret '{}' applied: {}",
+            secret_name,
+            out.trim()
+        );
+    })
+}
+
 /// Apply a PipelineRun and return the created resource name.
 pub fn create_pipeline_run(kubeconfig_yaml: &str, pipeline_run_yaml: &str) -> Result<String, String> {
     let kc_path = write_temp_file("ginger-gitter-kc-", ".yaml", kubeconfig_yaml)?;
@@ -105,7 +175,8 @@ pub fn create_pipeline_run(kubeconfig_yaml: &str, pipeline_run_yaml: &str) -> Re
 
 fn write_temp_file(prefix: &str, suffix: &str, content: &str) -> Result<PathBuf, String> {
     let path = std::env::temp_dir().join(format!(
-        "{}{}{}", prefix,
+        "{}{}{}",
+        prefix,
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -120,12 +191,13 @@ fn write_temp_file(prefix: &str, suffix: &str, content: &str) -> Result<PathBuf,
 }
 
 fn run_kubectl_apply(kc_path: &PathBuf, resource_yaml: &str) -> Result<String, String> {
-    let mut child = Command::new("kubectl")
+    let kubectl = find_kubectl();
+    let mut child = Command::new(&kubectl)
         .args([
             "--kubeconfig",
             kc_path.to_str().unwrap_or("/tmp/kc.yaml"),
             "apply",
-            "--server-side",  // idempotent, works for Tasks/Pipelines with same name
+            "--server-side",
             "-f",
             "-",
         ])
@@ -133,10 +205,12 @@ fn run_kubectl_apply(kc_path: &PathBuf, resource_yaml: &str) -> Result<String, S
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
-        .map_err(|e| format!("failed to spawn kubectl: {}", e))?;
+        .map_err(|e| format!(
+            "failed to spawn kubectl (tried {}): {}",
+            kubectl.display(), e
+        ))?;
 
-    if let Some(stdin) = child.stdin.take() {
-        let mut stdin = stdin;
+    if let Some(mut stdin) = child.stdin.take() {
         stdin
             .write_all(resource_yaml.as_bytes())
             .map_err(|e| format!("failed to write to kubectl stdin: {}", e))?;
@@ -157,10 +231,11 @@ fn run_kubectl_apply(kc_path: &PathBuf, resource_yaml: &str) -> Result<String, S
     }
 }
 
-/// `kubectl create` is used for PipelineRun because it uses generateName and
-/// must not be applied (apply doesn't support generateName).
+/// `kubectl create` is used for PipelineRun because it uses generateName —
+/// `apply` does not support generateName.
 fn run_kubectl_create(kc_path: &PathBuf, resource_yaml: &str) -> Result<String, String> {
-    let mut child = Command::new("kubectl")
+    let kubectl = find_kubectl();
+    let mut child = Command::new(&kubectl)
         .args([
             "--kubeconfig",
             kc_path.to_str().unwrap_or("/tmp/kc.yaml"),
@@ -172,10 +247,12 @@ fn run_kubectl_create(kc_path: &PathBuf, resource_yaml: &str) -> Result<String, 
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
-        .map_err(|e| format!("failed to spawn kubectl: {}", e))?;
+        .map_err(|e| format!(
+            "failed to spawn kubectl (tried {}): {}",
+            kubectl.display(), e
+        ))?;
 
-    if let Some(stdin) = child.stdin.take() {
-        let mut stdin = stdin;
+    if let Some(mut stdin) = child.stdin.take() {
         stdin
             .write_all(resource_yaml.as_bytes())
             .map_err(|e| format!("failed to write to kubectl stdin: {}", e))?;
@@ -202,7 +279,8 @@ fn run_kubectl_ensure_namespace(kc_path: &PathBuf, namespace: &str) -> Result<()
         namespace
     );
 
-    let mut child = Command::new("kubectl")
+    let kubectl = find_kubectl();
+    let mut child = Command::new(&kubectl)
         .args([
             "--kubeconfig",
             kc_path.to_str().unwrap_or("/tmp/kc.yaml"),
@@ -214,10 +292,12 @@ fn run_kubectl_ensure_namespace(kc_path: &PathBuf, namespace: &str) -> Result<()
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
-        .map_err(|e| format!("failed to spawn kubectl for namespace: {}", e))?;
+        .map_err(|e| format!(
+            "failed to spawn kubectl (tried {}): {}",
+            kubectl.display(), e
+        ))?;
 
-    if let Some(stdin) = child.stdin.take() {
-        let mut stdin = stdin;
+    if let Some(mut stdin) = child.stdin.take() {
         stdin
             .write_all(ns_yaml.as_bytes())
             .map_err(|e| format!("failed to write namespace yaml: {}", e))?;
@@ -231,9 +311,10 @@ fn run_kubectl_ensure_namespace(kc_path: &PathBuf, namespace: &str) -> Result<()
         println!("[ginger-gitter] Namespace {} ensured", namespace);
         Ok(())
     } else {
-        // Namespace already exists is not fatal
         let stderr = String::from_utf8_lossy(&output.stderr);
+        // Already exists is not fatal
         if stderr.contains("already exists") {
+            println!("[ginger-gitter] Namespace {} already exists", namespace);
             return Ok(());
         }
         Err(format!(

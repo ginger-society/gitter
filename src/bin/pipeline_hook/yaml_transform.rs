@@ -24,11 +24,12 @@ pub fn transform_task(yaml: &str, namespace: &str) -> Result<String, String> {
 /// System params injected into every Pipeline's spec.params.
 /// Must match exactly what build_pipeline_run writes into the PipelineRun params.
 const SYSTEM_PARAMS: &[(&str, &str)] = &[
-    ("gl_user",    "string"),
-    ("gl_repo",    "string"),
-    ("gl_refname", "string"),
-    ("gl_new_rev", "string"),
-    ("image_tag",  "string"),
+    ("gl_user",                  "string"),
+    ("gl_repo",                  "string"),
+    ("gl_refname",               "string"),
+    ("gl_new_rev",               "string"),
+    ("image_tag",                "string"),
+    ("deployment_target_secret", "string"),
 ];
 
 pub fn transform_pipeline(yaml: &str, namespace: &str, gl_repo: &str) -> Result<String, String> {
@@ -48,6 +49,7 @@ pub fn build_pipeline_run(
     gl_repo: &str,
     gl_refname: &str,
     gl_new_rev: &str,
+    deployment_target_secret: &str,
 ) -> String {
     // image_tag = branch name (e.g. "dev-vriksh-feat1" or "main").
     // This is the system-managed tag: the developer supplies only the image
@@ -61,11 +63,12 @@ pub fn build_pipeline_run(
 
     // System params always injected — these feed $(params.image_tag) etc.
     for (k, v) in &[
-        ("gl_user",   gl_user),
-        ("gl_repo",   gl_repo),
-        ("gl_refname", gl_refname),
-        ("gl_new_rev", gl_new_rev),
-        ("image_tag",  image_tag.as_str()),
+        ("gl_user",                   gl_user),
+        ("gl_repo",                   gl_repo),
+        ("gl_refname",                gl_refname),
+        ("gl_new_rev",                gl_new_rev),
+        ("image_tag",                 image_tag.as_str()),
+        ("deployment_target_secret",  deployment_target_secret),
     ] {
         params_yaml.push_str(&format!("    - name: {}\n      value: \"{}\"\n", k, v));
     }

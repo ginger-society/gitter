@@ -12,7 +12,11 @@ pub struct PipelineDefinition {
     pub concurrency: String,
 }
 
-/// All context passed to a triggered PipelineRun as params.
+/// All context passed to a triggered PipelineRun.
+///
+/// `kubeconfig` is the workspace/environment kubeconfig (staging or per-branch
+/// ephemeral). It is `None` when no environment has been provisioned yet —
+/// the build pipeline runs normally but deployment steps have no target.
 #[derive(Debug)]
 pub struct PipelineRunContext {
     pub gl_user: String,
@@ -23,7 +27,7 @@ pub struct PipelineRunContext {
     pub gl_new_rev: String,
     pub gl_changed_files: Vec<String>,
     pub workspace: String,
-    pub kubeconfig: String,
+    pub kubeconfig: Option<String>,
     pub sidecar_url: String,
     pub ginger_token: String,
 }
