@@ -35,7 +35,7 @@ jobs:
 
     
     - name: Build gitter service Docker image
-      run: docker build -t ${{ secrets.DOCKER_HUB_USERNAME }}/ginger-gitter-service:latest . --build-arg GINGER_TOKEN=${{ secrets.GINGER_TOKEN }} --platform="linux/amd64" 
+      run: docker build -t ${{ secrets.DOCKER_HUB_USERNAME }}/ginger-gitter-service:latest . -f Dockerfile.service --build-arg GINGER_TOKEN=${{ secrets.GINGER_TOKEN }} --platform="linux/amd64" 
 
     - name: Push gitter service Docker image
       run: docker push ${{ secrets.DOCKER_HUB_USERNAME }}/ginger-gitter-service:latest
