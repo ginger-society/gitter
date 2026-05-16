@@ -1,43 +1,27 @@
-# ── Build stage ───────────────────────────────────────────────────────────────
-FROM rust:1.78-slim AS builder
+FROM docker.io/gingersociety/rust-rocket-api-builder:latest as builder
 
+ARG GINGER_TOKEN
+
+# Create a new directory for the app
 WORKDIR /app
-
-# Cache dependencies layer
-COPY Cargo.toml Cargo.lock* ./
-RUN mkdir src && echo 'fn main(){}' > src/main.rs
-RUN cargo build --release 2>/dev/null || true
-RUN rm -f target/release/deps/gitolite_sidecar*
-
-# Build the real binary
-COPY src ./src
+COPY . .
+# Run the ginger-auth command and capture the output
+# RUN ginger-auth token-login $GINGER_TOKEN
+# RUN ginger-connector connect stage
+# Build the application in release mode
 RUN cargo build --release
 
-# ── Runtime stage ─────────────────────────────────────────────────────────────
-FROM debian:bookworm-slim
+# Copy binary from mounted volume into the container filesystem
+RUN cp /app/target/release/ginger-gitter /app/ginger-gitter
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
-        git \
-        openssh-client \
-        ca-certificates \
-        curl \
-    && rm -rf /var/lib/apt/lists/*
+# Second stage: Create the minimal runtime image
+FROM docker.io/gingersociety/rust-rocket-api-runner:latest
 
-# Create unprivileged user
-RUN useradd -m -u 1000 sidecar
+# Copy the compiled binary from the builder stage
+COPY --from=builder /app/ginger-gitter /app/
 
-# SSH directory (key mounts land here)
-RUN mkdir -p /home/sidecar/.ssh && chown -R sidecar:sidecar /home/sidecar/.ssh
+# Set the working directory
+WORKDIR /app
 
-# Work directories
-RUN mkdir -p /data/gitolite-admin /data/gitolite-home /tmp/gitolite-backup \
-    && chown -R sidecar:sidecar /data /tmp/gitolite-backup
-
-COPY --from=builder /app/target/release/gitolite-sidecar /usr/local/bin/gitolite-sidecar
-RUN chmod +x /usr/local/bin/gitolite-sidecar
-
-USER sidecar
-
-EXPOSE 8080
-
-ENTRYPOINT ["/usr/local/bin/gitolite-sidecar"]
+# Run the executable when the container starts
+ENTRYPOINT ["./ginger-gitter"]

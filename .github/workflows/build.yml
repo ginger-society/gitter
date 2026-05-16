@@ -27,9 +27,18 @@ jobs:
     - name: build hook
       run: ./build-hook.sh
 
-    - name: Build Rocket rust builder Docker image
+    - name: Build gitter Docker image
       run: docker build -t ${{ secrets.DOCKER_HUB_USERNAME }}/gitter:latest . --build-arg GINGER_TOKEN=${{ secrets.GINGER_TOKEN }} --platform="linux/amd64" 
 
-    - name: Push Rocket rust builder Docker image
+    - name: Push gitter Docker image
       run: docker push ${{ secrets.DOCKER_HUB_USERNAME }}/gitter:latest
+
+    
+    - name: Build gitter service Docker image
+      run: docker build -t ${{ secrets.DOCKER_HUB_USERNAME }}/ginger-gitter-service:latest . --build-arg GINGER_TOKEN=${{ secrets.GINGER_TOKEN }} --platform="linux/amd64" 
+
+    - name: Push gitter service Docker image
+      run: docker push ${{ secrets.DOCKER_HUB_USERNAME }}/ginger-gitter-service:latest
+
+
 
