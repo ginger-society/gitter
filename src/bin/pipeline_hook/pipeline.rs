@@ -165,12 +165,16 @@ pub fn run(
     );
 
     // ── 12. Trigger each matched pipeline ─────────────────────────────────────
-    // Namespace convention: tasks-<repo> (no workspace prefix — the repo name
-    // already carries the workspace, e.g. "rackmint-provisioner-service").
-    let namespace = format!(
-        "tasks-{}",
-        gl_repo.replace('/', "-").replace('_', "-")
-    );
+    // Namespace convention: tasks-<repo-basename>.
+    // gl_repo is a gitolite path like "rackmint/rackmint-provisioner-service";
+    // we use only the final component after the last '/' so we don't duplicate
+    // the workspace prefix that gitolite already includes in the repo name itself.
+    let repo_basename = gl_repo
+        .rsplit('/')
+        .next()
+        .unwrap_or(gl_repo)
+        .replace('_', "-");
+    let namespace = format!("tasks-{}", repo_basename);
     println!("[ginger-gitter] Target namespace: {}", namespace);
 
     for pipeline in &triggered {
@@ -273,7 +277,7 @@ fn trigger_pipeline(
     for task_file in &task_files {
         match read_file_from_commit(repo_path, new_rev, task_file) {
             Ok(raw_yaml) => {
-                let transformed = transform_task(&raw_yaml, namespace)
+                let transformed = transform_task(&raw_yaml, namespace, &deployment_target_secret_name)
                     .map_err(|e| format!("failed to transform task {}: {}", task_file, e))?;
 
                 println!("[ginger-gitter] Applying task: {}", task_file);
@@ -320,7 +324,6 @@ fn trigger_pipeline(
         &ctx.gl_repo,
         &ctx.gl_refname,
         &ctx.gl_new_rev,
-        &deployment_target_secret_name,
     );
 
     println!("[ginger-gitter] Creating PipelineRun for: {}", pipeline.pipeline_name);
