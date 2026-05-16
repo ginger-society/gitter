@@ -20,8 +20,12 @@ FROM docker.io/gingersociety/rust-rocket-api-runner:latest
 USER root
 RUN apt-get update && apt-get install -y --no-install-recommends \
     git \
-    git-filter-repo \
+    wget \
+    python3 \
     openssh-client \
+  && wget -O /usr/local/bin/git-filter-repo \
+     https://raw.githubusercontent.com/newren/git-filter-repo/main/git-filter-repo \
+  && chmod +x /usr/local/bin/git-filter-repo \
   && rm -rf /var/lib/apt/lists/*
 
 
