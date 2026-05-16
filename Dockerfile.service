@@ -17,6 +17,13 @@ RUN cp /app/target/release/ginger-gitter /app/ginger-gitter
 # Second stage: Create the minimal runtime image
 FROM docker.io/gingersociety/rust-rocket-api-runner:latest
 
+USER root
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git \
+    openssh-client \
+  && rm -rf /var/lib/apt/lists/*
+
+
 # Copy the compiled binary from the builder stage
 COPY --from=builder /app/ginger-gitter /app/
 
