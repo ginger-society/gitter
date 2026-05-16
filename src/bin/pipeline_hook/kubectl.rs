@@ -66,48 +66,151 @@ spec:
     })
 }
 
-/// Ensure namespace-scoped PVCs exist.
+/// Ensure namespace-scoped PVCs exist and are Bound.
 /// Call after ensure_buildah_pv so the NFS PV is ready before the PVC binds.
+///
+/// PVCs are immutable once created — we can't apply changes to a stuck Pending
+/// PVC. Instead we check status: if Pending we delete and recreate it so it
+/// gets a fresh binding attempt against the now-present PV.
 pub fn ensure_pvcs(kubeconfig_yaml: &str, namespace: &str) -> Result<(), String> {
-    let general_pvc = format!(
-        r#"apiVersion: v1
-kind: PersistentVolumeClaim
-metadata:
-  name: general-purpose-cache-pvc
-  namespace: {namespace}
-spec:
+    ensure_single_pvc(
+        kubeconfig_yaml,
+        namespace,
+        "general-purpose-cache-pvc",
+        r#"spec:
   accessModes:
     - ReadWriteOnce
   resources:
     requests:
-      storage: 20Gi
-"#,
-        namespace = namespace
-    );
+      storage: 20Gi"#,
+    )?;
 
-    let buildah_pvc = format!(
-        r#"apiVersion: v1
-kind: PersistentVolumeClaim
-metadata:
-  name: buildah-cache-pvc
-  namespace: {namespace}
-spec:
+    ensure_single_pvc(
+        kubeconfig_yaml,
+        namespace,
+        "buildah-cache-pvc",
+        r#"spec:
   accessModes:
     - ReadWriteMany
   resources:
     requests:
       storage: 100Gi
   storageClassName: ""
-  volumeName: buildah-cache-pv
-"#,
-        namespace = namespace
+  volumeName: buildah-cache-pv"#,
+    )?;
+
+    Ok(())
+}
+
+/// Create a PVC if it doesn't exist, or recreate it if it's stuck in Pending.
+/// Bound PVCs are left completely untouched.
+fn ensure_single_pvc(
+    kubeconfig_yaml: &str,
+    namespace: &str,
+    name: &str,
+    spec_yaml: &str,
+) -> Result<(), String> {
+    let kubectl = find_kubectl();
+    let kc_path = write_temp_file("ginger-gitter-kc-", ".yaml", kubeconfig_yaml)?;
+
+    // Check current status
+    let status_out = Command::new(&kubectl)
+        .args([
+            "--kubeconfig", kc_path.to_str().unwrap_or("/tmp/kc.yaml"),
+            "get", "pvc", name,
+            "-n", namespace,
+            "-o", "jsonpath={.status.phase}",
+            "--ignore-not-found",
+        ])
+        .output()
+        .map_err(|e| format!("failed to check PVC {}: {}", name, e))?;
+
+    let phase = String::from_utf8_lossy(&status_out.stdout).trim().to_string();
+
+    match phase.as_str() {
+        "Bound" => {
+            println!("[ginger-gitter] PVC {} already Bound — skipping", name);
+            let _ = std::fs::remove_file(&kc_path);
+            return Ok(());
+        }
+        "Pending" => {
+            println!(
+                "[ginger-gitter] PVC {} stuck in Pending — deleting for recreation",
+                name
+            );
+            let _ = Command::new(&kubectl)
+                .args([
+                    "--kubeconfig", kc_path.to_str().unwrap_or("/tmp/kc.yaml"),
+                    "delete", "pvc", name,
+                    "-n", namespace,
+                    "--wait=false",
+                ])
+                .output();
+        }
+        "" => {
+            println!("[ginger-gitter] PVC {} not found — creating", name);
+        }
+        other => {
+            println!("[ginger-gitter] PVC {} status: {} — recreating", name, other);
+            let _ = Command::new(&kubectl)
+                .args([
+                    "--kubeconfig", kc_path.to_str().unwrap_or("/tmp/kc.yaml"),
+                    "delete", "pvc", name,
+                    "-n", namespace,
+                    "--wait=false",
+                ])
+                .output();
+        }
+    }
+
+    // Create the PVC
+    let pvc_yaml = format!(
+        "apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {name}
+  namespace: {namespace}
+{spec_yaml}
+",
+        name = name,
+        namespace = namespace,
+        spec_yaml = spec_yaml,
     );
 
-    let combined = format!("{}\n---\n{}", general_pvc, buildah_pvc);
+    let mut child = Command::new(&kubectl)
+        .args([
+            "--kubeconfig", kc_path.to_str().unwrap_or("/tmp/kc.yaml"),
+            "create", "-f", "-",
+        ])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("failed to spawn kubectl create pvc: {}", e))?;
 
-    kubectl_apply(kubeconfig_yaml, &combined).map(|out| {
-        println!("[ginger-gitter] PVC apply output: {}", out.trim());
-    })
+    if let Some(mut stdin) = child.stdin.take() {
+        use std::io::Write;
+        stdin.write_all(pvc_yaml.as_bytes())
+            .map_err(|e| format!("failed to write PVC yaml: {}", e))?;
+    }
+
+    let out = child.wait_with_output()
+        .map_err(|e| format!("kubectl create pvc wait failed: {}", e))?;
+
+    let _ = std::fs::remove_file(&kc_path);
+
+    if out.status.success() {
+        println!("[ginger-gitter] ✓ PVC {} created", name);
+        Ok(())
+    } else {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        // Already exists race (two hooks fired simultaneously) — not fatal
+        if stderr.contains("already exists") {
+            println!("[ginger-gitter] PVC {} already exists (race) — ok", name);
+            return Ok(());
+        }
+        Err(format!("failed to create PVC {}: {}", name, stderr.trim()))
+    }
 }
 
 /// Ensure the `ginger-token-secret` Secret exists in the namespace.
@@ -225,6 +328,7 @@ fn run_kubectl_apply(kc_path: &PathBuf, resource_yaml: &str) -> Result<String, S
             kc_path.to_str().unwrap_or("/tmp/kc.yaml"),
             "apply",
             "--server-side",
+            "--force-conflicts",
             "-f",
             "-",
         ])
