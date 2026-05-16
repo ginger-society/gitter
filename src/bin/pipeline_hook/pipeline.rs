@@ -6,8 +6,8 @@ use crate::pipeline_hook::gitops::{
     resolve_workspace,
 };
 use crate::pipeline_hook::kubectl::{
-    create_pipeline_run, ensure_deployment_target_secret, ensure_ginger_token_secret,
-    ensure_namespace, ensure_pvcs, kubectl_apply,
+    create_pipeline_run, ensure_buildah_pv, ensure_deployment_target_secret,
+    ensure_ginger_token_secret, ensure_namespace, ensure_pvcs, kubectl_apply,
 };
 use crate::pipeline_hook::types::{PipelineDefinition, PipelineRunContext};
 use crate::pipeline_hook::yaml::{parse_pipeline_yaml, should_trigger};
@@ -212,7 +212,13 @@ fn trigger_pipeline(
     ensure_namespace(tekton_kubeconfig, namespace)
         .map_err(|e| format!("failed to ensure namespace {}: {}", namespace, e))?;
 
-    // ── 12b. Ensure PVCs exist ────────────────────────────────────────────────
+    // ── 12b. Ensure cluster-level NFS PV then namespace PVCs ────────────────
+    // buildah-cache-pv must exist at cluster scope before buildah-cache-pvc
+    // can bind. ensure_buildah_pv is idempotent — no-ops if PV already exists.
+    println!("[ginger-gitter] Ensuring buildah-cache-pv (cluster-level NFS PV) …");
+    ensure_buildah_pv(tekton_kubeconfig)
+        .map_err(|e| format!("failed to ensure buildah-cache-pv: {}", e))?;
+
     println!("[ginger-gitter] Ensuring PVCs in namespace: {}", namespace);
     ensure_pvcs(tekton_kubeconfig, namespace)
         .map_err(|e| format!("failed to ensure PVCs in {}: {}", namespace, e))?;

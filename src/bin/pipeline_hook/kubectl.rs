@@ -41,6 +41,33 @@ pub fn ensure_namespace(kubeconfig_yaml: &str, namespace: &str) -> Result<(), St
 
 /// Ensure the two persistent volume claims exist in the namespace.
 /// Uses `kubectl apply` with a PVC manifest so it's idempotent.
+/// Ensure the cluster-level NFS PersistentVolume for the buildah cache exists.
+/// Cluster-scoped (no namespace). Safe to call on every run — idempotent.
+/// NFS server and path match the cluster runbook: 172.18.0.1:/srv/nfs/buildah-cache
+pub fn ensure_buildah_pv(kubeconfig_yaml: &str) -> Result<(), String> {
+    let pv_yaml = r#"apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: buildah-cache-pv
+spec:
+  capacity:
+    storage: 100Gi
+  accessModes:
+    - ReadWriteMany
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: ""
+  nfs:
+    server: 172.18.0.1
+    path: /srv/nfs/buildah-cache
+"#;
+
+    kubectl_apply(kubeconfig_yaml, pv_yaml).map(|out| {
+        println!("[ginger-gitter] buildah-cache-pv: {}", out.trim());
+    })
+}
+
+/// Ensure namespace-scoped PVCs exist.
+/// Call after ensure_buildah_pv so the NFS PV is ready before the PVC binds.
 pub fn ensure_pvcs(kubeconfig_yaml: &str, namespace: &str) -> Result<(), String> {
     let general_pvc = format!(
         r#"apiVersion: v1
