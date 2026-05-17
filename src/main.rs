@@ -8,6 +8,9 @@ mod requests;
 mod routes;
 mod state;
 mod permissions;
+mod auth_helpers;
+mod auth_schemas;
+
 
 use anyhow::Result;
 use tokio_cron_scheduler::{Job, JobScheduler};

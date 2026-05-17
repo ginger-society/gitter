@@ -21,6 +21,9 @@ utoipa = {version = "2", features = ["json"]}
 utoipa-swagger-ui = "2.0"
 base64 = "0.22"
 serde_yaml = "0.9"
+ginger-shared-rs = {version = "0.38.0-nightly.0", organization = "ginger-society"}
+jsonwebtoken = "9.3.0"
+
 
 [profile.release]
 opt-level = 3

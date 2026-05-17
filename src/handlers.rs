@@ -1,12 +1,15 @@
 use std::convert::Infallible;
 
+use ginger_shared_rs::rocket_utils::APIClaims;
+use ginger_shared_rs::ISCClaims;
 use tracing::{error, info, warn};
 use warp::http::StatusCode;
 
 use crate::permissions::{self, MemberType};
 use crate::redis_lock::{mark_dirty, signal_pending};
 use crate::requests::{
-    AddMemberRequest, ApiResponse, KubeconfigRequest, MemberTypeDto, RemoveMemberRequest, UpdatePipelineTokenRequest, UpdateTektonKubeconfigRequest
+    AddMemberRequest, ApiResponse, KubeconfigRequest, MemberTypeDto, RemoveMemberRequest,
+    UpdatePipelineTokenRequest, UpdateTektonKubeconfigRequest,
 };
 use crate::state::AppState;
 
@@ -33,40 +36,32 @@ async fn schedule_push(state: &AppState) {
 
 // ── POST /workspace/:workspace/member ────────────────────────────────────────
 
-/// Add a user or group to a workspace
-///
-/// Appends the member to the appropriate list file
-/// (`permissions/<workspace>/users` or `.../groups`), then regenerates
-/// `conf/gitolite.conf` and schedules a debounced push to gitolite.
-///
-/// Sending a member that already exists is a no-op (returns 200).
 #[utoipa::path(
     post,
     path = "/workspace/{workspace}/member",
     tag = "Permissions",
+    security(("apiISCBearerAuth" = [])),
     params(
-        ("workspace" = String, Path, description = "Workspace name, e.g. `wname`"),
+        ("workspace" = String, Path, description = "Workspace name"),
     ),
-    request_body(
-        content = AddMemberRequest,
-        description = "Member type and identifier",
-        content_type = "application/json"
-    ),
+    request_body(content = AddMemberRequest, content_type = "application/json"),
     responses(
-        (status = 200, description = "Member already present — no change", body = ApiResponse),
-        (status = 201, description = "Member added and conf queued for push", body = ApiResponse),
+        (status = 200, description = "Member already present", body = ApiResponse),
+        (status = 201, description = "Member added", body = ApiResponse),
         (status = 400, description = "Validation error", body = ApiResponse),
+        (status = 401, description = "Unauthorized", body = ApiResponse),
         (status = 500, description = "Internal error", body = ApiResponse),
     )
 )]
 pub async fn handle_add_member(
     workspace: String,
     body: AddMemberRequest,
+    _claims: ISCClaims,         // extracted by with_isc_auth() — identity confirmed
     state: AppState,
 ) -> Result<impl warp::Reply, Infallible> {
     info!(
-        "POST /workspace/{workspace}/member type={:?} name={}",
-        body.r#type, body.name
+        "POST /workspace/{workspace}/member type={:?} name={} caller={}",
+        body.r#type, body.name, _claims.sub
     );
 
     if workspace.trim().is_empty() {
@@ -91,7 +86,7 @@ pub async fn handle_add_member(
     let kind = to_member_type(&body.r#type);
     let repo = state.0.admin_repo.lock().await;
     let repo_root = repo.repo_path.clone();
-    drop(repo); // release before async I/O
+    drop(repo);
 
     let added = match permissions::add_member(&repo_root, &workspace, &kind, &body.name).await {
         Ok(a) => a,
@@ -126,8 +121,7 @@ pub async fn handle_add_member(
                 status: "ok",
                 message: Some(format!(
                     "added {} '{}' to workspace '{workspace}'",
-                    kind.as_str(),
-                    body.name
+                    kind.as_str(), body.name
                 )),
             }),
             StatusCode::CREATED,
@@ -138,8 +132,7 @@ pub async fn handle_add_member(
                 status: "ok",
                 message: Some(format!(
                     "{} '{}' already in workspace '{workspace}' — no change",
-                    kind.as_str(),
-                    body.name
+                    kind.as_str(), body.name
                 )),
             }),
             StatusCode::OK,
@@ -149,37 +142,29 @@ pub async fn handle_add_member(
 
 // ── DELETE /workspace/:workspace/member ──────────────────────────────────────
 
-/// Remove a user or group from a workspace
-///
-/// Removes the member from the list file and regenerates `conf/gitolite.conf`,
-/// then schedules a debounced push. Removing a member that is not present
-/// is a no-op (returns 200).
 #[utoipa::path(
     delete,
     path = "/workspace/{workspace}/member",
     tag = "Permissions",
-    params(
-        ("workspace" = String, Path, description = "Workspace name"),
-    ),
-    request_body(
-        content = RemoveMemberRequest,
-        description = "Member type and identifier to remove",
-        content_type = "application/json"
-    ),
+    security(("apiISCBearerAuth" = [])),
+    params(("workspace" = String, Path, description = "Workspace name")),
+    request_body(content = RemoveMemberRequest, content_type = "application/json"),
     responses(
         (status = 200, description = "Member removed or was not present", body = ApiResponse),
         (status = 400, description = "Validation error", body = ApiResponse),
+        (status = 401, description = "Unauthorized", body = ApiResponse),
         (status = 500, description = "Internal error", body = ApiResponse),
     )
 )]
 pub async fn handle_remove_member(
     workspace: String,
     body: RemoveMemberRequest,
+    _claims: ISCClaims,
     state: AppState,
 ) -> Result<impl warp::Reply, Infallible> {
     info!(
-        "DELETE /workspace/{workspace}/member type={:?} name={}",
-        body.r#type, body.name
+        "DELETE /workspace/{workspace}/member type={:?} name={} caller={}",
+        body.r#type, body.name, _claims.sub
     );
 
     if workspace.trim().is_empty() {
@@ -248,33 +233,27 @@ pub async fn handle_remove_member(
 
 // ── POST /kubeconfig ─────────────────────────────────────────────────────────
 
-/// Write a workspace kubeconfig
-///
-/// Writes the kubeconfig YAML to `kubeconfig/<workspace>/<environment>.yaml`
-/// inside the gitolite-admin repository and schedules a debounced push.
-/// There is intentionally no GET endpoint.
 #[utoipa::path(
     post,
     path = "/kubeconfig",
     tag = "Admin",
-    request_body(
-        content = KubeconfigRequest,
-        description = "Workspace, environment, and raw kubeconfig YAML",
-        content_type = "application/json"
-    ),
+    security(("apiBearerAuth" = [])),
+    request_body(content = KubeconfigRequest, content_type = "application/json"),
     responses(
         (status = 202, description = "Queued for push", body = ApiResponse),
         (status = 400, description = "Validation error", body = ApiResponse),
+        (status = 401, description = "Unauthorized", body = ApiResponse),
         (status = 500, description = "Internal error", body = ApiResponse),
     )
 )]
 pub async fn handle_kubeconfig(
     body: KubeconfigRequest,
+    _claims: APIClaims,
     state: AppState,
 ) -> Result<impl warp::Reply, Infallible> {
     info!(
-        "POST /kubeconfig workspace={} environment={} ({} bytes)",
-        body.workspace, body.environment, body.kubeconfig.len()
+        "POST /kubeconfig workspace={} environment={} ({} bytes) caller={}",
+        body.workspace, body.environment, body.kubeconfig.len(), _claims.sub
     );
 
     if body.workspace.trim().is_empty() {
@@ -325,7 +304,6 @@ pub async fn handle_kubeconfig(
 
 // ── GET /healthz ─────────────────────────────────────────────────────────────
 
-/// Liveness probe
 #[utoipa::path(
     get,
     path = "/healthz",
@@ -343,32 +321,27 @@ pub async fn handle_health() -> Result<impl warp::Reply, Infallible> {
 
 // ── POST /tekton-kubeconfig ──────────────────────────────────────────────────
 
-/// Write the shared Tekton kubeconfig
-///
-/// Writes the kubeconfig YAML to `kubeconfig.yaml` at the root of the
-/// gitolite-admin repository and schedules a debounced push.
 #[utoipa::path(
     post,
     path = "/tekton-kubeconfig",
     tag = "Admin",
-    request_body(
-        content = UpdateTektonKubeconfigRequest,
-        description = "Raw kubeconfig YAML for Tekton",
-        content_type = "application/json"
-    ),
+    security(("apiBearerAuth" = [])),
+    request_body(content = UpdateTektonKubeconfigRequest, content_type = "application/json"),
     responses(
         (status = 202, description = "Queued for push", body = ApiResponse),
         (status = 400, description = "Validation error", body = ApiResponse),
+        (status = 401, description = "Unauthorized", body = ApiResponse),
         (status = 500, description = "Internal error", body = ApiResponse),
     )
 )]
 pub async fn handle_update_tekton_kubeconfig(
     body: UpdateTektonKubeconfigRequest,
+    _claims: APIClaims,
     state: AppState,
 ) -> Result<impl warp::Reply, Infallible> {
     info!(
-        "POST /tekton-kubeconfig ({} bytes)",
-        body.kubeconfig.len()
+        "POST /tekton-kubeconfig ({} bytes) caller={}",
+        body.kubeconfig.len(), _claims.sub
     );
 
     if body.kubeconfig.trim().is_empty() {
@@ -405,36 +378,29 @@ pub async fn handle_update_tekton_kubeconfig(
     ))
 }
 
-
 // ── POST /pipeline-token ─────────────────────────────────────────────────────
 
-/// Write a workspace pipeline token
-///
-/// Writes the GINGER_TOKEN value to `pipeline-tokens/<workspace>` inside the
-/// gitolite-admin repository (no file extension) and schedules a debounced push.
 #[utoipa::path(
     post,
     path = "/pipeline-token",
     tag = "Admin",
-    request_body(
-        content = UpdatePipelineTokenRequest,
-        description = "Workspace and raw GINGER_TOKEN value",
-        content_type = "application/json"
-    ),
+    security(("apiBearerAuth" = [])),
+    request_body(content = UpdatePipelineTokenRequest, content_type = "application/json"),
     responses(
         (status = 202, description = "Queued for push", body = ApiResponse),
         (status = 400, description = "Validation error", body = ApiResponse),
+        (status = 401, description = "Unauthorized", body = ApiResponse),
         (status = 500, description = "Internal error", body = ApiResponse),
     )
 )]
 pub async fn handle_update_pipeline_token(
     body: UpdatePipelineTokenRequest,
+    _claims: APIClaims,
     state: AppState,
 ) -> Result<impl warp::Reply, Infallible> {
     info!(
-        "POST /pipeline-token workspace={} ({} bytes)",
-        body.workspace,
-        body.token.len()
+        "POST /pipeline-token workspace={} ({} bytes) caller={}",
+        body.workspace, body.token.len(), _claims.sub
     );
 
     if body.workspace.trim().is_empty() {
