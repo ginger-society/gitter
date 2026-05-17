@@ -1,38 +1,16 @@
 use std::collections::HashMap;
 
-/// The fixed set of workspaces every task/pipeline gets.
-const INJECTED_WORKSPACES: &[&str] = &["creds", "source", "general-purpose-cache", "buildah-cache"];
+use serde_yaml::{Mapping, Value};
 
-/// Built-in tasks prepended to every pipeline before the user's tasks.
-const BUILTIN_TASKS: &[(&str, &str)] = &[
-    ("init-credentials", "init-credentials"),
-    ("clone", "clone"),
+// ── Constants ─────────────────────────────────────────────────────────────────
+
+const INJECTED_WORKSPACES: &[&str] = &[
+    "creds",
+    "source",
+    "general-purpose-cache",
+    "buildah-cache",
 ];
 
-// ── Public entry points ───────────────────────────────────────────────────────
-
-/// Placeholder the user writes in their task YAML to reference the
-/// deployment-target kubeconfig secret. The hook replaces it with the
-/// real branch-scoped secret name at transform time, before kubectl sees it.
-/// This sidesteps Kubernetes validating the field before Tekton can substitute
-/// a param value — secretKeyRef.name is resolved by k8s, not Tekton.
-pub const DEPLOYMENT_TARGET_PLACEHOLDER: &str = "ginger-gitter/deployment-target";
-
-/// Transform a user-written Task YAML:
-/// - inject namespace
-/// - replace deployment-target placeholder with the real secret name
-/// - inject workspaces
-/// - inject GINGER_TOKEN env
-pub fn transform_task(yaml: &str, namespace: &str, deployment_target_secret: &str) -> Result<String, String> {
-    let yaml = inject_namespace(yaml, namespace)?;
-    let yaml = replace_deployment_target_placeholder(&yaml, deployment_target_secret);
-    let yaml = inject_task_workspaces(&yaml)?;
-    let yaml = inject_ginger_token_env(&yaml)?;
-    Ok(yaml)
-}
-
-/// Transform a user-written Pipeline YAML: inject namespace, workspaces, prepend
-/// init-credentials → clone tasks, fix runAfter on the first user task.
 /// System params injected into every Pipeline's spec.params.
 /// Must match exactly what build_pipeline_run writes into the PipelineRun params.
 const SYSTEM_PARAMS: &[(&str, &str)] = &[
@@ -43,15 +21,62 @@ const SYSTEM_PARAMS: &[(&str, &str)] = &[
     ("image_tag",  "string"),
 ];
 
-pub fn transform_pipeline(yaml: &str, namespace: &str, gl_repo: &str) -> Result<String, String> {
-    let yaml = inject_namespace(yaml, namespace)?;
-    let yaml = inject_system_params(&yaml)?;
-    let yaml = inject_pipeline_workspaces(&yaml)?;
-    let yaml = inject_builtin_pipeline_tasks(&yaml, gl_repo)?;
-    Ok(yaml)
+/// Placeholder the user writes in secretKeyRef.name to reference the
+/// deployment-target kubeconfig secret. Replaced at transform time with the
+/// real branch-scoped secret name so Kubernetes never sees a Tekton variable
+/// expression in a field it validates before Tekton can substitute it.
+pub const DEPLOYMENT_TARGET_PLACEHOLDER: &str = "ginger-gitter/deployment-target";
+
+// ── Public entry points ───────────────────────────────────────────────────────
+
+/// Transform a user-written Task YAML:
+/// - inject namespace
+/// - replace deployment-target placeholder with real secret name
+/// - inject workspaces into spec.workspaces
+/// - inject GINGER_TOKEN env into every step
+pub fn transform_task(
+    yaml: &str,
+    namespace: &str,
+    deployment_target_secret: &str,
+) -> Result<String, String> {
+    // Placeholder replacement is intentionally a plain string operation —
+    // it needs to work regardless of quoting style before we parse the YAML.
+    let yaml = yaml.replace(DEPLOYMENT_TARGET_PLACEHOLDER, deployment_target_secret);
+
+    let mut doc = parse(&yaml)?;
+
+    set_namespace(&mut doc, namespace);
+    inject_task_workspaces(&mut doc);
+    inject_ginger_token_env(&mut doc);
+
+    serialize(&doc)
+}
+
+/// Transform a user-written Pipeline YAML:
+/// - inject namespace
+/// - inject system params into spec.params
+/// - inject workspaces into spec.workspaces and each task's workspaces
+/// - prepend init-credentials → clone tasks
+/// - set runAfter: [clone] on the first user task
+pub fn transform_pipeline(
+    yaml: &str,
+    namespace: &str,
+    gl_repo: &str,
+) -> Result<String, String> {
+    let mut doc = parse(yaml)?;
+
+    set_namespace(&mut doc, namespace);
+    inject_system_params(&mut doc);
+    inject_pipeline_workspaces(&mut doc);
+    inject_builtin_pipeline_tasks(&mut doc, gl_repo);
+
+    serialize(&doc)
 }
 
 /// Build a complete PipelineRun YAML for a triggered pipeline.
+/// The PipelineRun is constructed as a raw string (not via serde_yaml) because
+/// it uses generateName which serde_yaml would reorder unpredictably, and
+/// because the workspace volumeClaimTemplate blocks are static and verbose.
 pub fn build_pipeline_run(
     pipeline_name: &str,
     namespace: &str,
@@ -61,39 +86,27 @@ pub fn build_pipeline_run(
     gl_refname: &str,
     gl_new_rev: &str,
 ) -> String {
-    // image_tag = branch name (e.g. "dev-vriksh-feat1" or "main").
-    // This is the system-managed tag: the developer supplies only the image
-    // name in their task; ginger-gitter provides the tag here.
     let image_tag = gl_refname
         .strip_prefix("refs/heads/")
-        .unwrap_or(gl_refname)
-        .to_string();
+        .unwrap_or(gl_refname);
+
+    let ref_label  = sanitize_label(image_tag);
+    let repo_label = sanitize_label(gl_repo);
+    let sha_label  = &gl_new_rev[..8.min(gl_new_rev.len())];
 
     let mut params_yaml = String::new();
-
-    // System params always injected — these feed $(params.image_tag) etc.
     for (k, v) in &[
         ("gl_user",    gl_user),
         ("gl_repo",    gl_repo),
         ("gl_refname", gl_refname),
         ("gl_new_rev", gl_new_rev),
-        ("image_tag",  image_tag.as_str()),
+        ("image_tag",  image_tag),
     ] {
         params_yaml.push_str(&format!("    - name: {}\n      value: \"{}\"\n", k, v));
     }
-
-    // Any additional caller-supplied params (currently none, reserved for future use)
     for (k, v) in user_params {
         params_yaml.push_str(&format!("    - name: {}\n      value: \"{}\"\n", k, v));
     }
-
-    // Labels must match (([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])? and be <=63 chars.
-    // Strip refs/heads/ prefix then replace any remaining illegal chars with '-'.
-    let ref_label  = sanitize_label(
-        gl_refname.strip_prefix("refs/heads/").unwrap_or(gl_refname)
-    );
-    let repo_label = sanitize_label(gl_repo);
-    let sha_label  = &gl_new_rev[..8.min(gl_new_rev.len())];
 
     format!(
         r#"apiVersion: tekton.dev/v1beta1
@@ -147,24 +160,9 @@ spec:
     )
 }
 
-/// Sanitize a string for use as a Kubernetes label value.
-/// Replaces any character that is not alphanumeric, '-', '_', or '.' with '-',
-/// then trims leading/trailing '-' and truncates to 63 characters.
-fn sanitize_label(s: &str) -> String {
-    let cleaned: String = s
-        .chars()
-        .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' || c == '.' { c } else { '-' })
-        .collect();
-    let trimmed = cleaned.trim_matches('-');
-    // Truncate to 63 chars, trim any trailing '-' that truncation may expose
-    let truncated = &trimmed[..63.min(trimmed.len())];
-    truncated.trim_matches('-').to_string()
-}
-
 /// Build the fixed init-credentials Task YAML for a namespace.
 pub fn builtin_init_credentials_task(namespace: &str) -> String {
-    format!(
-        r#"apiVersion: tekton.dev/v1beta1
+    format!(r#"apiVersion: tekton.dev/v1beta1
 kind: Task
 metadata:
   name: init-credentials
@@ -186,15 +184,12 @@ spec:
         #!/bin/bash
         set -e
         /usr/local/bin/copy-credentials-to-workspace.sh
-"#,
-        namespace = namespace
-    )
+"#, namespace = namespace)
 }
 
 /// Build the fixed clone Task YAML for a namespace.
 pub fn builtin_clone_task(namespace: &str) -> String {
-    format!(
-        r#"apiVersion: tekton.dev/v1beta1
+    format!(r#"apiVersion: tekton.dev/v1beta1
 kind: Task
 metadata:
   name: clone
@@ -217,570 +212,219 @@ spec:
         git config --global init.defaultBranch main
         git clone git@source.gingersociety.org:$(params.repo).git /workspace/source/repo
         echo "Repository cloned successfully."
-"#,
-        namespace = namespace
-    )
+"#, namespace = namespace)
 }
 
-// ── Internal helpers ──────────────────────────────────────────────────────────
+// ── serde_yaml transformers ───────────────────────────────────────────────────
 
-/// Inject system params into spec.params, skipping any already declared by the user.
-fn inject_system_params(yaml: &str) -> Result<String, String> {
-    // Collect param names already declared by the user
-    let mut declared: Vec<String> = Vec::new();
-    let mut in_spec_params = false;
-
-    for line in yaml.lines() {
-        let trimmed = line.trim();
-        let indent = line.len() - line.trim_start().len();
-
-        if trimmed == "params:" && indent == 2 {
-            in_spec_params = true;
-            continue;
-        }
-        if in_spec_params {
-            // Exit on next sibling key at indent 2
-            if indent <= 2 && !trimmed.is_empty() && !trimmed.starts_with('-') {
-                break;
-            }
-            if let Some(rest) = trimmed.strip_prefix("- name:") {
-                declared.push(rest.trim().to_string());
-            }
-        }
-    }
-
-    let to_add: Vec<(&str, &str)> = SYSTEM_PARAMS
-        .iter()
-        .copied()
-        .filter(|(name, _)| !declared.iter().any(|d| d == name))
-        .collect();
-
-    if to_add.is_empty() {
-        return Ok(yaml.to_string());
-    }
-
-    let new_params = to_add
-        .iter()
-        .map(|(name, typ)| format!("    - name: {}
-      type: {}", name, typ))
-        .collect::<Vec<_>>()
-        .join("
-");
-
-    // Append into existing params: block, or insert before tasks:
-    inject_into_spec_block(yaml, "params:", &new_params, "tasks:")
+fn set_namespace(doc: &mut Value, namespace: &str) {
+    doc["metadata"]["namespace"] = val(namespace);
 }
 
-/// Replace every occurrence of the deployment-target placeholder with the
-/// real branch-scoped secret name. Simple string substitution — intentionally
-/// not YAML-aware so it works regardless of quoting style or indentation.
-fn replace_deployment_target_placeholder(yaml: &str, secret_name: &str) -> String {
-    yaml.replace(DEPLOYMENT_TARGET_PLACEHOLDER, secret_name)
-}
+fn inject_system_params(doc: &mut Value) {
+    let declared = str_seq_names(&doc["spec"]["params"]);
 
-/// Inject or replace `namespace:` under `metadata:`.
-fn inject_namespace(yaml: &str, namespace: &str) -> Result<String, String> {
-    let mut lines: Vec<String> = yaml.lines().map(|l| l.to_string()).collect();
-    let mut in_metadata = false;
-    let mut namespace_injected = false;
-    let mut metadata_index: Option<usize> = None;
-
-    for (i, line) in lines.iter().enumerate() {
-        let trimmed = line.trim();
-        if trimmed == "metadata:" {
-            in_metadata = true;
-            metadata_index = Some(i);
-            continue;
-        }
-        if in_metadata {
-            // leaving metadata block (next top-level key)
-            if !line.starts_with(' ') && !line.starts_with('\t') && !trimmed.is_empty() {
-                break;
-            }
-            if trimmed.starts_with("namespace:") {
-                // Replace existing
-                let indent = leading_spaces(line);
-                lines[i] = format!("{}namespace: {}", indent, namespace);
-                namespace_injected = true;
-                break;
-            }
-        }
-    }
-
-    if !namespace_injected {
-        if let Some(mi) = metadata_index {
-            // Insert after metadata: line, finding the right indent from next line
-            let indent = if mi + 1 < lines.len() {
-                leading_spaces(&lines[mi + 1])
-            } else {
-                "  ".to_string()
-            };
-            lines.insert(mi + 1, format!("{}namespace: {}", indent, namespace));
-        } else {
-            return Err("No metadata: block found in YAML".to_string());
-        }
-    }
-
-    Ok(lines.join("\n"))
-}
-
-/// Inject `workspaces:` list into a Task spec if not already present.
-fn inject_task_workspaces(yaml: &str) -> Result<String, String> {
-    // Collect which workspaces already declared
-    let existing = collect_declared_workspaces(yaml);
-    let to_add: Vec<&str> = INJECTED_WORKSPACES
-        .iter()
-        .copied()
-        .filter(|&w| !existing.iter().any(|e| e == w))
-        .collect();
-
-    if to_add.is_empty() {
-        return Ok(yaml.to_string());
-    }
-
-    let ws_yaml = to_add
-        .iter()
-        .map(|w| format!("    - name: {}", w))
-        .collect::<Vec<_>>()
-        .join("\n");
-
-    // Find existing workspaces: block and append, or inject before steps:
-    inject_into_spec_block(yaml, "workspaces:", &ws_yaml, "steps:")
-}
-
-/// Inject `workspaces:` list into a Pipeline spec if not already present,
-/// and ensure workspace entries in tasks reference them.
-fn inject_pipeline_workspaces(yaml: &str) -> Result<String, String> {
-    let existing = collect_declared_spec_workspaces(yaml);
-    let to_add: Vec<&str> = INJECTED_WORKSPACES
-        .iter()
-        .copied()
-        .filter(|&w| !existing.iter().any(|e| e == w))
-        .collect();
-
-    let mut result = yaml.to_string();
-
-    if !to_add.is_empty() {
-        let ws_yaml = to_add
-            .iter()
-            .map(|w| format!("    - name: {}", w))
-            .collect::<Vec<_>>()
-            .join("\n");
-        result = inject_into_spec_block(&result, "workspaces:", &ws_yaml, "tasks:")?;
-    }
-
-    // Now inject workspace bindings into each task entry in the pipeline
-    result = inject_pipeline_task_workspace_bindings(&result)?;
-
-    Ok(result)
-}
-
-/// For each `- name: <task>` block inside `tasks:` of a Pipeline, add workspace
-/// bindings if not already present.
-fn inject_pipeline_task_workspace_bindings(yaml: &str) -> Result<String, String> {
-    let lines: Vec<&str> = yaml.lines().collect();
-    let mut result: Vec<String> = Vec::new();
-    let mut in_pipeline_tasks = false;
-    let mut in_task_entry = false;
-    let mut task_entry_indent = 0usize;
-    let mut task_has_workspaces = false;
-    let mut pending_workspace_injection: Option<(usize, String)> = None; // (indent, yaml)
-
-    let ws_names: Vec<&str> = INJECTED_WORKSPACES.to_vec();
-
-    let mut i = 0;
-    while i < lines.len() {
-        let line = lines[i];
-        let trimmed = line.trim();
-        let indent = line.len() - line.trim_start().len();
-
-        // Detect `  tasks:` at spec level (indent 2)
-        if trimmed == "tasks:" && indent == 2 {
-            in_pipeline_tasks = true;
-            result.push(line.to_string());
-            i += 1;
-            continue;
-        }
-
-        if in_pipeline_tasks {
-            // Top-level key exits pipeline tasks
-            if !line.starts_with(' ') && !line.starts_with('\t') && !trimmed.is_empty() {
-                // flush any pending injection first
-                if let Some((ind, ws_block)) = pending_workspace_injection.take() {
-                    if !task_has_workspaces {
-                        result.push(ws_block);
-                    }
-                }
-                in_pipeline_tasks = false;
-                in_task_entry = false;
-                result.push(line.to_string());
-                i += 1;
-                continue;
-            }
-
-            // New task entry: `    - name:`
-            if trimmed.starts_with("- name:") && indent == 4 {
-                // Flush previous task's pending injection
-                if in_task_entry {
-                    if let Some((_ind, ws_block)) = pending_workspace_injection.take() {
-                        if !task_has_workspaces {
-                            result.push(ws_block);
-                        }
-                    }
-                }
-                in_task_entry = true;
-                task_entry_indent = indent;
-                task_has_workspaces = false;
-
-                // Build workspace binding block for this task
-                let ws_binding = ws_names
-                    .iter()
-                    .map(|w| {
-                        format!(
-                            "      - name: {}\n        workspace: {}",
-                            w, w
-                        )
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                let ws_block = format!("      workspaces:\n{}", ws_binding);
-                pending_workspace_injection = Some((indent, ws_block));
-
-                result.push(line.to_string());
-                i += 1;
-                continue;
-            }
-
-            if in_task_entry {
-                // Detect if workspaces: already declared for this task
-                if trimmed == "workspaces:" && indent == 6 {
-                    task_has_workspaces = true;
-                    pending_workspace_injection = None;
-                }
-                // Detect runAfter:, params:, taskRef: — inject workspaces before them if not done
-                if (trimmed.starts_with("runAfter:")
-                    || trimmed.starts_with("params:")
-                    || trimmed.starts_with("taskRef:"))
-                    && indent == 6
-                    && !task_has_workspaces
-                {
-                    if let Some((_ind, ws_block)) = pending_workspace_injection.take() {
-                        result.push(ws_block);
-                        task_has_workspaces = true;
-                    }
-                }
-            }
-        }
-
-        result.push(line.to_string());
-        i += 1;
-    }
-
-    // End of file flush
-    if in_pipeline_tasks {
-        if let Some((_ind, ws_block)) = pending_workspace_injection.take() {
-            if !task_has_workspaces {
-                result.push(ws_block);
-            }
-        }
-    }
-
-    Ok(result.join("\n"))
-}
-
-/// Prepend init-credentials and clone tasks to the pipeline's tasks list,
-/// and fix the first user task's runAfter to point to clone.
-fn inject_builtin_pipeline_tasks(yaml: &str, gl_repo: &str) -> Result<String, String> {
-    let lines: Vec<&str> = yaml.lines().collect();
-    let mut result: Vec<String> = Vec::new();
-    let mut tasks_block_start: Option<usize> = None;
-    let mut first_user_task_dash: Option<usize> = None;
-
-    // Find `  tasks:` and the first `    - name:` inside it
-    let mut in_tasks = false;
-    for (i, line) in lines.iter().enumerate() {
-        let trimmed = line.trim();
-        let indent = line.len() - line.trim_start().len();
-
-        if trimmed == "tasks:" && indent == 2 {
-            in_tasks = true;
-            tasks_block_start = Some(i);
-            continue;
-        }
-        if in_tasks {
-            if !line.starts_with(' ') && !line.starts_with('\t') && !trimmed.is_empty() {
-                break;
-            }
-            if trimmed.starts_with("- name:") && indent == 4 && first_user_task_dash.is_none() {
-                first_user_task_dash = Some(i);
-                break;
-            }
-        }
-    }
-
-    let tasks_line = tasks_block_start.ok_or("No tasks: block found in pipeline YAML")?;
-    let first_user_line = first_user_task_dash.ok_or("No task entries found in pipeline YAML")?;
-
-    // Determine the name of the first user task for runAfter injection
-    let first_user_task_name = lines[first_user_line]
-        .trim()
-        .strip_prefix("- name:")
-        .map(|s| s.trim().to_string())
+    let existing: Vec<Value> = doc["spec"]["params"]
+        .as_sequence()
+        .cloned()
         .unwrap_or_default();
 
-    // Build builtin task YAML blocks
-    let builtin_block = format!(
-        r#"    - name: init-credentials
-      taskRef:
-        name: init-credentials
-      workspaces:
-        - name: creds
-          workspace: creds
+    let injected: Vec<Value> = SYSTEM_PARAMS
+        .iter()
+        .filter(|(name, _)| !declared.contains(&name.to_string()))
+        .map(|(name, typ)| mapping(&[("name", val(name)), ("type", val(typ))]))
+        .collect();
 
-    - name: clone
-      taskRef:
-        name: clone
-      runAfter:
-        - init-credentials
-      params:
-        - name: repo
-          value: "{gl_repo}"
-      workspaces:
-        - name: creds
-          workspace: creds
-        - name: source
-          workspace: source
-
-"#,
-        gl_repo = gl_repo
-    );
-
-    // Reconstruct: output lines up to and including `tasks:`, then inject builtins,
-    // then the rest — but fix the first user task's runAfter.
-    for (i, line) in lines.iter().enumerate() {
-        if i == tasks_line {
-            result.push(line.to_string());
-            result.push(builtin_block.clone());
-            continue;
-        }
-
-        // On the first user task, ensure runAfter: [clone] is set
-        if i == first_user_line {
-            result.push(line.to_string());
-            // peek ahead to see if runAfter already follows
-            let next_lines: Vec<&str> = lines[i + 1..].iter().copied().take(5).collect();
-            let has_run_after = next_lines.iter().any(|l| l.trim().starts_with("runAfter:"));
-            if !has_run_after {
-                result.push("      runAfter:".to_string());
-                result.push("        - clone".to_string());
-            }
-            continue;
-        }
-
-        // Remove any existing runAfter that points somewhere other than clone
-        // for the first user task (replace it)
-        if i > first_user_line {
-            let trimmed = line.trim();
-            let indent = line.len() - line.trim_start().len();
-            // Only within the first user task block (indent >= 6)
-            if indent == 8 && trimmed.starts_with("- ") {
-                // This is a runAfter value for the first task — check context
-                // We rely on the replacement above; skip old runAfter entries
-                // only if they immediately follow a runAfter: we just replaced
-            }
-        }
-
-        result.push(line.to_string());
-    }
-
-    Ok(result.join("\n"))
+    doc["spec"]["params"] = Value::Sequence([existing, injected].concat());
 }
 
-/// Inject `GINGER_TOKEN` env into every `steps:` block of a Task.
-fn inject_ginger_token_env(yaml: &str) -> Result<String, String> {
-    // Check if already present
-    if yaml.contains("GINGER_TOKEN") {
-        return Ok(yaml.to_string());
+fn inject_task_workspaces(doc: &mut Value) {
+    let declared = str_seq_names(&doc["spec"]["workspaces"]);
+
+    let existing: Vec<Value> = doc["spec"]["workspaces"]
+        .as_sequence()
+        .cloned()
+        .unwrap_or_default();
+
+    let injected: Vec<Value> = INJECTED_WORKSPACES
+        .iter()
+        .filter(|&&w| !declared.contains(&w.to_string()))
+        .map(|&w| mapping(&[("name", val(w))]))
+        .collect();
+
+    doc["spec"]["workspaces"] = Value::Sequence([existing, injected].concat());
+}
+
+fn inject_pipeline_workspaces(doc: &mut Value) {
+    // Inject into spec.workspaces
+    let declared = str_seq_names(&doc["spec"]["workspaces"]);
+
+    let existing: Vec<Value> = doc["spec"]["workspaces"]
+        .as_sequence()
+        .cloned()
+        .unwrap_or_default();
+
+    let injected: Vec<Value> = INJECTED_WORKSPACES
+        .iter()
+        .filter(|&&w| !declared.contains(&w.to_string()))
+        .map(|&w| mapping(&[("name", val(w))]))
+        .collect();
+
+    doc["spec"]["workspaces"] = Value::Sequence([existing, injected].concat());
+
+    // Inject workspace bindings into every task entry
+    if let Some(tasks) = doc["spec"]["tasks"].as_sequence_mut() {
+        for task in tasks.iter_mut() {
+            inject_task_workspace_bindings(task);
+        }
+    }
+}
+
+/// Inject workspace bindings (name + workspace) into a single pipeline task entry.
+fn inject_task_workspace_bindings(task: &mut Value) {
+    let declared = str_seq_names(&task["workspaces"]);
+
+    let existing: Vec<Value> = task["workspaces"]
+        .as_sequence()
+        .cloned()
+        .unwrap_or_default();
+
+    let injected: Vec<Value> = INJECTED_WORKSPACES
+        .iter()
+        .filter(|&&w| !declared.contains(&w.to_string()))
+        .map(|&w| mapping(&[("name", val(w)), ("workspace", val(w))]))
+        .collect();
+
+    task["workspaces"] = Value::Sequence([existing, injected].concat());
+}
+
+/// Prepend init-credentials and clone tasks, fix runAfter on the first user task.
+fn inject_builtin_pipeline_tasks(doc: &mut Value, gl_repo: &str) {
+    let mut user_tasks: Vec<Value> = doc["spec"]["tasks"]
+        .as_sequence()
+        .cloned()
+        .unwrap_or_default();
+
+    // Set runAfter: [clone] on the first user task and inject its workspace bindings
+    if let Some(first) = user_tasks.first_mut() {
+        first["runAfter"] = Value::Sequence(vec![val("clone")]);
+        inject_task_workspace_bindings(first);
+    }
+    // Inject workspace bindings on remaining user tasks too
+    for task in user_tasks.iter_mut().skip(1) {
+        inject_task_workspace_bindings(task);
     }
 
-    let lines: Vec<&str> = yaml.lines().collect();
-    let mut result: Vec<String> = Vec::new();
-    let mut in_steps = false;
-    let mut in_step_entry = false;
-    let mut step_env_injected = false;
-    let mut pending_inject_before_script = false;
+    let init_creds: Value = mapping(&[
+        ("name", val("init-credentials")),
+        ("taskRef", mapping(&[("name", val("init-credentials"))])),
+        ("workspaces", Value::Sequence(vec![
+            mapping(&[("name", val("creds")), ("workspace", val("creds"))]),
+        ])),
+    ]);
 
-    for (i, line) in lines.iter().enumerate() {
-        let trimmed = line.trim();
-        let indent = line.len() - line.trim_start().len();
+    let clone_task: Value = mapping(&[
+        ("name", val("clone")),
+        ("taskRef", mapping(&[("name", val("clone"))])),
+        ("runAfter", Value::Sequence(vec![val("init-credentials")])),
+        ("params", Value::Sequence(vec![
+            mapping(&[("name", val("repo")), ("value", val(gl_repo))]),
+        ])),
+        ("workspaces", Value::Sequence(vec![
+            mapping(&[("name", val("creds")),   ("workspace", val("creds"))]),
+            mapping(&[("name", val("source")),  ("workspace", val("source"))]),
+        ])),
+    ]);
 
-        if trimmed == "steps:" && indent == 2 {
-            in_steps = true;
-            result.push(line.to_string());
+    let all_tasks: Vec<Value> = [vec![init_creds, clone_task], user_tasks].concat();
+    doc["spec"]["tasks"] = Value::Sequence(all_tasks);
+}
+
+/// Inject GINGER_TOKEN secretKeyRef env into every step that doesn't have it.
+fn inject_ginger_token_env(doc: &mut Value) {
+    let steps = match doc["spec"]["steps"].as_sequence_mut() {
+        Some(s) => s,
+        None => return,
+    };
+
+    let token_env: Value = mapping(&[
+        ("name", val("GINGER_TOKEN")),
+        ("valueFrom", mapping(&[
+            ("secretKeyRef", mapping(&[
+                ("name", val("ginger-token-secret")),
+                ("key",  val("token")),
+            ])),
+        ])),
+    ]);
+
+    for step in steps.iter_mut() {
+        let already = step["env"]
+            .as_sequence()
+            .unwrap_or(&vec![])
+            .iter()
+            .any(|e| e["name"].as_str() == Some("GINGER_TOKEN"));
+
+        if already {
             continue;
         }
 
-        if in_steps {
-            if !line.starts_with(' ') && !line.starts_with('\t') && !trimmed.is_empty() {
-                in_steps = false;
-                in_step_entry = false;
-                result.push(line.to_string());
-                continue;
-            }
+        let mut env: Vec<Value> = step["env"]
+            .as_sequence()
+            .cloned()
+            .unwrap_or_default();
 
-            // New step entry
-            if trimmed.starts_with("- name:") && indent == 4 {
-                // Flush pending for previous step
-                in_step_entry = true;
-                step_env_injected = false;
-                pending_inject_before_script = false;
-                result.push(line.to_string());
-                continue;
-            }
-
-            if in_step_entry {
-                if trimmed == "env:" && indent == 6 {
-                    step_env_injected = true;
-                    result.push(line.to_string());
-                    // Inject GINGER_TOKEN as the first env entry
-                    result.push(format!(
-                        "        - name: GINGER_TOKEN\n          valueFrom:\n            secretKeyRef:\n              name: ginger-token-secret\n              key: token"
-                    ));
-                    continue;
-                }
-                // Inject env block before script: or command:
-                if (trimmed.starts_with("script:") || trimmed.starts_with("command:"))
-                    && indent == 6
-                    && !step_env_injected
-                {
-                    result.push(format!(
-                        "      env:\n        - name: GINGER_TOKEN\n          valueFrom:\n            secretKeyRef:\n              name: ginger-token-secret\n              key: token"
-                    ));
-                    step_env_injected = true;
-                }
-            }
-        }
-
-        result.push(line.to_string());
+        // Insert at position 0 so GINGER_TOKEN is always first
+        env.insert(0, token_env.clone());
+        step["env"] = Value::Sequence(env);
     }
-
-    Ok(result.join("\n"))
 }
 
-// ── Utility helpers ───────────────────────────────────────────────────────────
+// ── Utilities ─────────────────────────────────────────────────────────────────
 
-fn leading_spaces(line: &str) -> String {
-    let count = line.len() - line.trim_start().len();
-    " ".repeat(count)
+/// Sanitize a string for use as a Kubernetes label value.
+/// Labels must be alphanumeric + [-_.], ≤63 chars, start/end with alphanumeric.
+pub fn sanitize_label(s: &str) -> String {
+    let cleaned: String = s
+        .chars()
+        .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' || c == '.' { c } else { '-' })
+        .collect();
+    let trimmed = cleaned.trim_matches('-');
+    trimmed[..63.min(trimmed.len())]
+        .trim_matches('-')
+        .to_string()
 }
 
-/// Collect workspace names already declared in a Task's `spec.workspaces:` block.
-fn collect_declared_workspaces(yaml: &str) -> Vec<String> {
-    let mut names = Vec::new();
-    let mut in_workspaces = false;
-
-    for line in yaml.lines() {
-        let trimmed = line.trim();
-        let indent = line.len() - line.trim_start().len();
-
-        if trimmed == "workspaces:" && indent == 2 {
-            in_workspaces = true;
-            continue;
-        }
-        if in_workspaces {
-            if !line.starts_with(' ') && !line.starts_with('\t') && !trimmed.is_empty() {
-                break;
-            }
-            if indent <= 2 && !trimmed.is_empty() && !trimmed.starts_with('-') {
-                break;
-            }
-            if let Some(rest) = trimmed.strip_prefix("- name:") {
-                names.push(rest.trim().to_string());
-            }
-        }
-    }
-    names
+/// Parse YAML string into a serde_yaml Value.
+fn parse(yaml: &str) -> Result<Value, String> {
+    serde_yaml::from_str(yaml).map_err(|e| format!("YAML parse error: {}", e))
 }
 
-/// Collect workspace names declared in a Pipeline's `spec.workspaces:` block
-/// (indent=2 level, not inside tasks).
-fn collect_declared_spec_workspaces(yaml: &str) -> Vec<String> {
-    let mut names = Vec::new();
-    let mut in_workspaces = false;
-
-    for line in yaml.lines() {
-        let trimmed = line.trim();
-        let indent = line.len() - line.trim_start().len();
-
-        // spec-level workspaces: at indent 2
-        if trimmed == "workspaces:" && indent == 2 {
-            in_workspaces = true;
-            continue;
-        }
-        if in_workspaces {
-            // Exit on next sibling key at indent 2
-            if indent <= 2 && !trimmed.is_empty() && !trimmed.starts_with('-') {
-                break;
-            }
-            if let Some(rest) = trimmed.strip_prefix("- name:") {
-                names.push(rest.trim().to_string());
-            }
-        }
-    }
-    names
+/// Serialize a serde_yaml Value back to a YAML string.
+fn serialize(doc: &Value) -> Result<String, String> {
+    serde_yaml::to_string(doc).map_err(|e| format!("YAML serialize error: {}", e))
 }
 
-/// Inject lines into an existing `<block_key>:` section, or insert the section
-/// before `<insert_before>:` if not present.
-fn inject_into_spec_block(
-    yaml: &str,
-    block_key: &str,    // e.g. "workspaces:"
-    new_lines: &str,
-    insert_before: &str, // e.g. "steps:" or "tasks:"
-) -> Result<String, String> {
-    let lines: Vec<&str> = yaml.lines().collect();
-    let mut result: Vec<String> = Vec::new();
-    let mut found_block = false;
-    let mut injected = false;
+/// Construct a serde_yaml Value::String.
+fn val(s: &str) -> Value {
+    Value::String(s.to_string())
+}
 
-    let block_key_trimmed = block_key.trim_end_matches(':');
-    let insert_before_trimmed = insert_before.trim_end_matches(':');
-
-    for line in &lines {
-        let trimmed = line.trim();
-        let indent = line.len() - line.trim_start().len();
-
-        if trimmed == block_key && indent == 2 {
-            found_block = true;
-            result.push(line.to_string());
-            continue;
-        }
-
-        if found_block && !injected {
-            // End of existing block — append new entries before the next sibling
-            if indent <= 2 && !trimmed.is_empty() && !trimmed.starts_with('-') {
-                result.push(new_lines.to_string());
-                injected = true;
-                found_block = false;
-            }
-        }
-
-        // Insert entire block before insert_before: if block not found yet
-        if !found_block && !injected && trimmed == insert_before && indent == 2 {
-            result.push(format!("  {}:", block_key_trimmed));
-            result.push(new_lines.to_string());
-            injected = true;
-        }
-
-        result.push(line.to_string());
+/// Construct a serde_yaml Value::Mapping from a slice of (key, value) pairs.
+fn mapping(pairs: &[(&str, Value)]) -> Value {
+    let mut m = Mapping::new();
+    for (k, v) in pairs {
+        m.insert(val(k), v.clone());
     }
+    Value::Mapping(m)
+}
 
-    // Append if block was last thing in file
-    if found_block && !injected {
-        result.push(new_lines.to_string());
-    }
-
-    Ok(result.join("\n"))
+/// Collect the `name` strings from a sequence of `{name: ...}` mappings.
+fn str_seq_names(seq: &Value) -> Vec<String> {
+    seq.as_sequence()
+        .unwrap_or(&vec![])
+        .iter()
+        .filter_map(|item| item["name"].as_str().map(|s| s.to_string()))
+        .collect()
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -789,25 +433,136 @@ fn inject_into_spec_block(
 mod tests {
     use super::*;
 
+    const TASK_YAML: &str = r#"
+apiVersion: tekton.dev/v1beta1
+kind: Task
+metadata:
+  name: build-and-push
+spec:
+  params:
+    - name: image_tag
+      type: string
+  steps:
+    - name: build
+      image: gingersociety/tekton-task-buildah:latest
+      script: |
+        #!/bin/bash
+        echo hello
+"#;
+
+    const PIPELINE_YAML: &str = r#"
+apiVersion: tekton.dev/v1beta1
+kind: Pipeline
+metadata:
+  name: build-pipeline
+  annotations:
+    x-gitter-enabled: "true"
+    x-gitter-task-trigger-branch: '["refs/heads/main"]'
+spec:
+  params:
+    - name: image_tag
+      type: string
+  tasks:
+    - name: build-and-push
+      taskRef:
+        name: build-and-push
+      params:
+        - name: image_tag
+          value: $(params.image_tag)
+"#;
+
     #[test]
-    fn test_inject_namespace() {
-        let yaml = "apiVersion: tekton.dev/v1beta1\nkind: Task\nmetadata:\n  name: foo\nspec:\n  steps: []\n";
-        let out = inject_namespace(yaml, "my-ns").unwrap();
-        assert!(out.contains("namespace: my-ns"), "got: {}", out);
+    fn test_task_namespace_injected() {
+        let out = transform_task(TASK_YAML, "tasks-my-repo", "deployment-target-main").unwrap();
+        let doc: Value = serde_yaml::from_str(&out).unwrap();
+        assert_eq!(doc["metadata"]["namespace"].as_str(), Some("tasks-my-repo"));
     }
 
     #[test]
-    fn test_inject_namespace_replaces_existing() {
-        let yaml = "apiVersion: tekton.dev/v1beta1\nkind: Task\nmetadata:\n  name: foo\n  namespace: old-ns\nspec:\n  steps: []\n";
-        let out = inject_namespace(yaml, "new-ns").unwrap();
-        assert!(out.contains("namespace: new-ns"));
-        assert!(!out.contains("namespace: old-ns"));
+    fn test_task_workspaces_injected() {
+        let out = transform_task(TASK_YAML, "tasks-my-repo", "deployment-target-main").unwrap();
+        let doc: Value = serde_yaml::from_str(&out).unwrap();
+        let ws_names: Vec<&str> = doc["spec"]["workspaces"]
+            .as_sequence().unwrap()
+            .iter()
+            .filter_map(|w| w["name"].as_str())
+            .collect();
+        for &ws in INJECTED_WORKSPACES {
+            assert!(ws_names.contains(&ws), "missing workspace: {}", ws);
+        }
     }
 
     #[test]
-    fn test_ginger_token_injected() {
-        let yaml = "apiVersion: tekton.dev/v1beta1\nkind: Task\nmetadata:\n  name: t\nspec:\n  steps:\n    - name: build\n      image: foo\n      script: |\n        echo hi\n";
-        let out = inject_ginger_token_env(yaml).unwrap();
-        assert!(out.contains("GINGER_TOKEN"), "got: {}", out);
+    fn test_task_ginger_token_injected() {
+        let out = transform_task(TASK_YAML, "tasks-my-repo", "deployment-target-main").unwrap();
+        let doc: Value = serde_yaml::from_str(&out).unwrap();
+        let envs = &doc["spec"]["steps"][0]["env"];
+        let names: Vec<&str> = envs.as_sequence().unwrap()
+            .iter()
+            .filter_map(|e| e["name"].as_str())
+            .collect();
+        assert!(names.contains(&"GINGER_TOKEN"), "GINGER_TOKEN not injected: {:?}", names);
+    }
+
+    #[test]
+    fn test_task_deployment_placeholder_replaced() {
+        let yaml = TASK_YAML.replace(
+            "image: gingersociety/tekton-task-buildah:latest",
+            "image: gingersociety/tekton-task-buildah:latest\n      env:\n        - name: KUBECONFIG\n          valueFrom:\n            secretKeyRef:\n              name: ginger-gitter/deployment-target\n              key: kubeconfig.yaml",
+        );
+        let out = transform_task(&yaml, "ns", "deployment-target-dev-alice").unwrap();
+        assert!(out.contains("deployment-target-dev-alice"));
+        assert!(!out.contains("ginger-gitter/deployment-target"));
+    }
+
+    #[test]
+    fn test_pipeline_namespace_injected() {
+        let out = transform_pipeline(PIPELINE_YAML, "tasks-my-repo", "my-repo").unwrap();
+        let doc: Value = serde_yaml::from_str(&out).unwrap();
+        assert_eq!(doc["metadata"]["namespace"].as_str(), Some("tasks-my-repo"));
+    }
+
+    #[test]
+    fn test_pipeline_system_params_injected() {
+        let out = transform_pipeline(PIPELINE_YAML, "tasks-my-repo", "my-repo").unwrap();
+        let doc: Value = serde_yaml::from_str(&out).unwrap();
+        let param_names: Vec<&str> = doc["spec"]["params"]
+            .as_sequence().unwrap()
+            .iter()
+            .filter_map(|p| p["name"].as_str())
+            .collect();
+        // image_tag declared by user, system params injected, no duplicates
+        assert!(param_names.contains(&"image_tag"));
+        assert!(param_names.contains(&"gl_user"));
+        assert!(param_names.contains(&"gl_repo"));
+        assert_eq!(param_names.iter().filter(|&&n| n == "image_tag").count(), 1,
+            "image_tag duplicated");
+    }
+
+    #[test]
+    fn test_pipeline_builtin_tasks_prepended() {
+        let out = transform_pipeline(PIPELINE_YAML, "tasks-my-repo", "my-repo").unwrap();
+        let doc: Value = serde_yaml::from_str(&out).unwrap();
+        let tasks = doc["spec"]["tasks"].as_sequence().unwrap();
+        assert_eq!(tasks[0]["name"].as_str(), Some("init-credentials"));
+        assert_eq!(tasks[1]["name"].as_str(), Some("clone"));
+        assert_eq!(tasks[2]["name"].as_str(), Some("build-and-push"));
+    }
+
+    #[test]
+    fn test_pipeline_first_user_task_run_after_clone() {
+        let out = transform_pipeline(PIPELINE_YAML, "tasks-my-repo", "my-repo").unwrap();
+        let doc: Value = serde_yaml::from_str(&out).unwrap();
+        let tasks = doc["spec"]["tasks"].as_sequence().unwrap();
+        let run_after = tasks[2]["runAfter"].as_sequence().unwrap();
+        assert_eq!(run_after[0].as_str(), Some("clone"));
+    }
+
+    #[test]
+    fn test_sanitize_label() {
+        assert_eq!(sanitize_label("refs/heads/dev-alice"), "refs-heads-dev-alice");
+        assert_eq!(sanitize_label("dev-alice"), "dev-alice");
+        assert_eq!(sanitize_label("-bad-"), "bad");
+        assert_eq!(sanitize_label(&"a".repeat(100)), "a".repeat(63));
     }
 }
