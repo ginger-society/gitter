@@ -371,13 +371,13 @@ pub async fn mirror_repo_to_github(
     let mut pushed_any = false;
     for branch in &["main", "master"] {
         let check = tokio::process::Command::new("git")
-            .args(["rev-parse", "--verify", &format!("refs/heads/{branch}")])  // ← fix here
+            .args(["rev-parse", "--verify", &format!("refs/remotes/origin/{branch}")])
             .current_dir(&rewrite_dir)
             .output()
             .await?;
 
         if check.status.success() {
-            let refspec = format!("refs/heads/{branch}:refs/heads/{branch}");
+            let refspec = format!("refs/remotes/origin/{branch}:refs/heads/{branch}");
             match run_git(&["push", "--force", &push_url, &refspec], &rewrite_dir, &gh_ssh_cmd).await {
                 Ok(_) => {
                     info!("[backup] [{repo}] ✓ pushed {branch}");
