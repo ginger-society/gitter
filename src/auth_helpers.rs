@@ -75,30 +75,6 @@ fn authenticate_isc_token(token: &str) -> Result<ISCClaims, ()> {
         .map_err(|_| ())
 }
 
-// ── Raw header extractors (for handlers that need the token string) ────────────
-
-pub fn with_get_auth_header(
-) -> impl Filter<Extract = (String,), Error = warp::Rejection> + Clone {
-    warp::header::<String>("Authorization").and_then(|h: String| async move {
-        extract_bearer(Some(h)).ok_or_else(|| warp::reject::custom(InvalidTokenError))
-    })
-}
-
-pub fn with_get_api_auth_header(
-) -> impl Filter<Extract = (String,), Error = warp::Rejection> + Clone {
-    warp::header::<String>("X-API-Authorization").and_then(|h: String| async move {
-        extract_bearer(Some(h)).ok_or_else(|| warp::reject::custom(InvalidTokenError))
-    })
-}
-
-pub fn with_get_isc_auth_header(
-) -> impl Filter<Extract = (String,), Error = warp::Rejection> + Clone {
-    warp::header::<String>("X-ISC-API-Authorization").and_then(|h: String| async move {
-        extract_bearer(Some(h)).ok_or_else(|| warp::reject::custom(InvalidTokenError))
-    })
-}
-
-// ── Utility ───────────────────────────────────────────────────────────────────
 
 /// Strip "Bearer " prefix if present, return None if header is absent or empty.
 fn extract_bearer(header: Option<String>) -> Option<String> {

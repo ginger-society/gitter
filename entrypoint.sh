@@ -3,6 +3,8 @@ set -euo pipefail
 
 GIT_HOME=/home/git
 
+chmod 755 $GIT_HOME
+
 if [[ ! -f $GIT_HOME/.gitolite/conf/gitolite.conf ]]; then
   echo "[entrypoint] Initializing gitolite..."
 
