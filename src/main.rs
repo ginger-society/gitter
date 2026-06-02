@@ -105,12 +105,12 @@ async fn main() -> Result<()> {
     scheduler.start().await?;
     info!("[backup] ✓ cron registered (fires at :00 of every hour)");
 
-    // // ── Startup backup ────────────────────────────────────────────────────────
-    // info!("[backup] running initial backup on startup …");
-    // match backup::run_backup(&state).await {
-    //     Ok(_)  => info!("[backup] ✓ startup backup complete"),
-    //     Err(e) => error!("[backup] ✗ startup backup failed: {e:#}"),
-    // }
+    // ── Startup backup ────────────────────────────────────────────────────────
+    info!("[backup] running initial backup on startup …");
+    match backup::run_backup(&state).await {
+        Ok(_)  => info!("[backup] ✓ startup backup complete"),
+        Err(e) => error!("[backup] ✗ startup backup failed: {e:#}"),
+    }
 
     // ── HTTP server ───────────────────────────────────────────────────────────
     println!();
