@@ -10,6 +10,8 @@ mod state;
 mod permissions;
 mod auth_helpers;
 mod auth_schemas;
+mod handler_create_db_taskrun;
+mod kubectl_async;
 
 
 use anyhow::Result;

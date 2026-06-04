@@ -4,7 +4,7 @@ use utoipa::OpenApi;
 use utoipa_swagger_ui::Config;
 use warp::Filter;
 
-use crate::auth_helpers::{with_api_auth, with_isc_auth};
+use crate::auth_helpers::{with_api_auth, with_auth, with_isc_auth};
 use crate::auth_schemas::SecurityAddon;
 use crate::error::handle_rejection;
 use crate::handlers::{
@@ -14,9 +14,12 @@ use crate::handlers::{
     handle_add_member, handle_health, handle_kubeconfig, handle_remove_member,
     handle_update_pipeline_token, handle_update_tekton_kubeconfig,
 };
+use crate::handler_create_db_taskrun::{
+    __path_handle_create_db_taskrun, __path_handle_db_taskrun_logs,  handle_create_db_taskrun, handle_db_taskrun_logs
+};
+
 use crate::requests::{
-    AddMemberRequest, ApiResponse, KubeconfigRequest, MemberTypeDto, RemoveMemberRequest,
-    UpdatePipelineTokenRequest, UpdateTektonKubeconfigRequest,
+    AddMemberRequest, ApiResponse, CreateDbTaskRunRequest, KubeconfigRequest, MemberTypeDto, RemoveMemberRequest, TaskRunCreateResponse, UpdatePipelineTokenRequest, UpdateTektonKubeconfigRequest, DbTaskRunLogsRequest, TaskRunLogsResponse
 };
 use crate::state::AppState;
 
@@ -31,6 +34,8 @@ use crate::state::AppState;
         handle_health,
         handle_update_tekton_kubeconfig,
         handle_update_pipeline_token,
+        handle_create_db_taskrun,
+        handle_db_taskrun_logs
     ),
     components(schemas(
         AddMemberRequest,
@@ -40,6 +45,10 @@ use crate::state::AppState;
         ApiResponse,
         UpdateTektonKubeconfigRequest,
         UpdatePipelineTokenRequest,
+        CreateDbTaskRunRequest,
+        TaskRunCreateResponse,
+        DbTaskRunLogsRequest,
+        TaskRunLogsResponse
     )),
     modifiers(&SecurityAddon),
     tags(
@@ -123,6 +132,33 @@ pub fn build(
         .and(with_state(state.clone()))
         .and_then(handle_update_pipeline_token);
 
+
+    // POST /taskrun/db/create
+    // Auth: standard Bearer JWT (Claims) — called by human users / front-end
+    let create_db_taskrun = warp::post()
+        .and(warp::path("taskrun"))
+        .and(warp::path("db"))
+        .and(warp::path("create"))
+        .and(warp::path::end())
+        .and(warp::body::content_length_limit(64 * 1024))
+        .and(warp::body::json())
+        // .and(with_auth())          // ← Claims (Authorization: Bearer <jwt>)
+        .and(with_state(state.clone()))
+        .and_then(handle_create_db_taskrun);
+
+
+      // POST /taskrun/db/logs
+    let db_taskrun_logs = warp::post()
+        .and(warp::path("taskrun"))
+        .and(warp::path("db"))
+        .and(warp::path("logs"))
+        .and(warp::path::end())
+        .and(warp::body::content_length_limit(64 * 1024))
+        .and(warp::body::json())
+        // .and(with_auth())           // ← Claims (Authorization: Bearer <jwt>)
+        .and(with_state(state.clone()))
+        .and_then(handle_db_taskrun_logs);
+
     // GET /healthz — no auth, liveness probe must be reachable by k8s
     let health = warp::get()
         .and(warp::path("healthz"))
@@ -145,11 +181,16 @@ pub fn build(
 
     let log = warp::log("gitolite_sidecar::http");
 
+
+    
+
     let routes = add_member
         .or(remove_member)
         .or(kubeconfig)
         .or(tekton_kubeconfig)
         .or(pipeline_token)
+        .or(create_db_taskrun)
+        .or(db_taskrun_logs)
         .or(health)
         .or(api_doc)
         .or(swagger_ui)

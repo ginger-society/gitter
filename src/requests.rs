@@ -88,3 +88,64 @@ pub struct UpdatePipelineTokenRequest {
     #[schema(example = "ginger_tok_abc123")]
     pub token: String,
 }
+
+
+/// POST /taskrun/db/create — trigger a DB migration TaskRun for a workspace.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct CreateDbTaskRunRequest {
+    /// Workspace identifier. The DB repo is derived as `{workspace_id}-database`
+    /// and the namespace as `tasks-{workspace_id}-database`.
+    #[schema(example = "acme")]
+    pub workspace_id: String,
+
+    /// The models.py / models JSON content to be passed into the migration step.
+    #[schema(example = "{ \"models\": [] }")]
+    pub models_py_content: String,
+
+    /// Optional git commit message for the migration commit.
+    #[schema(example = "feat: add user table")]
+    pub commit_message: Option<String>,
+
+    /// Whether the migration step should commit and push after applying.
+    #[schema(example = "true")]
+    pub commit: bool,
+
+    #[schema(example = "IAM")]
+    pub db_name: String,
+}
+
+/// POST /taskrun/db/logs — fetch logs and step status for a running or completed TaskRun.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct DbTaskRunLogsRequest {
+    /// The full TaskRun name returned by the create endpoint,
+    /// e.g. `db-migrate-acme-run-xk9f2`.
+    #[schema(example = "db-migrate-acme-run-xk9f2")]
+    pub taskrun_name: String,
+
+    /// The step to fetch logs for. Use the bare name without the `step-` prefix,
+    /// e.g. `"clone"` or `"print-args"`.
+    #[schema(example = "print-args")]
+    pub step_name: String,
+}
+
+/// Response for TaskRun creation.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct TaskRunCreateResponse {
+    /// `ok` or `error`.
+    pub status: &'static str,
+    /// The created TaskRun name, e.g. `db-migrate-acme-run-xk9f2`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub taskrun_name: Option<String>,
+    /// Human-readable detail or error message.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+/// Response for TaskRun log fetching.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct TaskRunLogsResponse {
+    /// Collected log lines from the requested step container.
+    pub logs: String,
+    /// Step termination reason: `Succeeded`, `Failed`, `Running`, or `Unknown`.
+    pub status: String,
+}
