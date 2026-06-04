@@ -21,6 +21,7 @@ USER root
 RUN apt-get update && apt-get install -y --no-install-recommends \
     git \
     wget \
+    curl \
     python3 \
     openssh-client \
   && wget -O /usr/local/bin/git-filter-repo \
