@@ -68,6 +68,11 @@ pub fn build(
     state: AppState,
 ) -> impl Filter<Extract = impl warp::Reply, Error = std::convert::Infallible> + Clone + Send + Sync {
 
+    let cors = warp::cors()
+        .allow_any_origin()
+        .allow_headers(vec!["content-type", "authorization"])
+        .allow_methods(vec!["GET", "POST", "PUT", "DELETE", "OPTIONS"]);
+
     // POST /workspace/:workspace/member
     // Auth: ISC — called by the provisioner service, not humans
     let add_member = warp::post()
@@ -189,7 +194,8 @@ pub fn build(
         .or(health)
         .or(api_doc)
         .or(swagger_ui)
-        .with(log);
+        .with(log)
+        .with(cors);
 
     routes.recover(handle_rejection)
 }
