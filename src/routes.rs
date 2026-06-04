@@ -51,11 +51,6 @@ use crate::state::AppState;
         TaskRunLogsResponse
     )),
     modifiers(&SecurityAddon),
-    tags(
-        (name = "Permissions", description = "Workspace membership — drives gitolite.conf generation"),
-        (name = "Admin",       description = "Kubeconfig and token storage"),
-        (name = "Internal",    description = "Liveness / readiness probes"),
-    )
 )]
 pub struct ApiDoc;
 
