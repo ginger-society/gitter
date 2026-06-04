@@ -1,5 +1,6 @@
 [package]
 name = "ginger-gitter"
+description = "A service to sync PRs and Pipelines to Ginger"
 version = "0.1.0"
 edition = "2024"
 default-run = "ginger-gitter"
@@ -38,3 +39,7 @@ path = "src/main.rs"
 [[bin]]
 name = "ginger-gitter-pipeline-hook"
 path = "src/bin/ginger-gitter-pipeline-hook.rs"
+
+
+[package.metadata]
+organization = "ginger-society"

@@ -1,0 +1,21 @@
+lang = "Rust"
+organization_id = "ginger-society"
+dir = "."
+spec_url = "/api-doc.json"
+service_type = "RPCEndpoint"
+
+[services]
+
+
+[portals_refs]
+
+[ws_refs]
+
+[urls]
+stage_k8 = "https://source.gingersociety.org"
+stage = "https://source.gingersociety.org"
+prod = "https://source.gingersociety.org"
+prod_k8 = "https://source.gingersociety.org"
+dev = "http://localhost:8080"
+
+[urls_ws]

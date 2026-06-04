@@ -32,7 +32,7 @@ use crate::state::AppState;
 #[utoipa::path(
     post,
     path = "/taskrun/db/create",
-    tag = "Taskrun",
+    tag = "default",
     security(("bearerAuth" = [])),
     request_body(content = CreateDbTaskRunRequest, content_type = "application/json"),
     responses(
@@ -230,7 +230,7 @@ pub async fn handle_create_db_taskrun(
 #[utoipa::path(
     post,
     path = "/taskrun/db/logs",
-    tag = "Taskrun",
+    tag = "default",
     security(("bearerAuth" = [])),
     request_body(content = DbTaskRunLogsRequest, content_type = "application/json"),
     responses(

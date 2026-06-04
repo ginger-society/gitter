@@ -39,7 +39,7 @@ async fn schedule_push(state: &AppState) {
 #[utoipa::path(
     post,
     path = "/workspace/{workspace}/member",
-    tag = "Permissions",
+    tag = "default",
     security(("apiISCBearerAuth" = [])),
     params(
         ("workspace" = String, Path, description = "Workspace name"),
@@ -145,7 +145,7 @@ pub async fn handle_add_member(
 #[utoipa::path(
     delete,
     path = "/workspace/{workspace}/member",
-    tag = "Permissions",
+    tag = "default",
     security(("apiISCBearerAuth" = [])),
     params(("workspace" = String, Path, description = "Workspace name")),
     request_body(content = RemoveMemberRequest, content_type = "application/json"),
@@ -236,7 +236,7 @@ pub async fn handle_remove_member(
 #[utoipa::path(
     post,
     path = "/kubeconfig",
-    tag = "Admin",
+    tag = "default",
     security(("apiBearerAuth" = [])),
     request_body(content = KubeconfigRequest, content_type = "application/json"),
     responses(
@@ -307,7 +307,7 @@ pub async fn handle_kubeconfig(
 #[utoipa::path(
     get,
     path = "/healthz",
-    tag = "Internal",
+    tag = "default",
     responses(
         (status = 200, description = "Service is healthy", body = ApiResponse),
     )
@@ -324,7 +324,7 @@ pub async fn handle_health() -> Result<impl warp::Reply, Infallible> {
 #[utoipa::path(
     post,
     path = "/tekton-kubeconfig",
-    tag = "Admin",
+    tag = "default",
     security(("apiBearerAuth" = [])),
     request_body(content = UpdateTektonKubeconfigRequest, content_type = "application/json"),
     responses(
@@ -383,7 +383,7 @@ pub async fn handle_update_tekton_kubeconfig(
 #[utoipa::path(
     post,
     path = "/pipeline-token",
-    tag = "Admin",
+    tag = "default",
     security(("apiBearerAuth" = [])),
     request_body(content = UpdatePipelineTokenRequest, content_type = "application/json"),
     responses(
