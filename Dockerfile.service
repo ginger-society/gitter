@@ -28,6 +28,24 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
   && chmod +x /usr/local/bin/git-filter-repo \
   && rm -rf /var/lib/apt/lists/*
 
+  # ── kubectl ───────────────────────────────────────────────────────────────────
+# Download the latest stable kubectl binary for the host architecture.
+# The binary lands at /usr/local/bin/kubectl — the path probed first by
+# find_kubectl() in the pipeline hook, so no PATH tricks are needed.
+RUN set -eux; \
+    ARCH=$(uname -m); \
+    case "$ARCH" in \
+      x86_64)  KUBECTL_ARCH=amd64 ;; \
+      aarch64) KUBECTL_ARCH=arm64 ;; \
+      armv7l)  KUBECTL_ARCH=arm ;; \
+      *)        echo "Unsupported arch: $ARCH" >&2; exit 1 ;; \
+    esac; \
+    KUBECTL_VERSION=$(curl -fsSL https://dl.k8s.io/release/stable.txt); \
+    curl -fsSL "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/${KUBECTL_ARCH}/kubectl" \
+         -o /usr/local/bin/kubectl; \
+    chmod 755 /usr/local/bin/kubectl; \
+    kubectl version --client
+
 
 # Copy the compiled binary from the builder stage
 COPY --from=builder /app/ginger-gitter /app/
