@@ -1,6 +1,6 @@
 FROM alpine:3.19
 
-RUN apk add --no-cache openssh bash git perl curl
+RUN apk add --no-cache openssh bash git perl curl make
 
 # Install gitolite
 RUN git clone https://github.com/sitaramc/gitolite /opt/gitolite && \
