@@ -24,9 +24,9 @@ use crate::requests::{
 use crate::state::AppState;
 
 use crate::repo_handler::{
-    __path_handle_file_content, __path_handle_diff,
-    handle_file_content, handle_diff,
-    FileContentRequest, FileContentResponse, DiffRequest, DiffResponse, FileDiff, DiffStatus,
+    __path_handle_file_content, __path_handle_org_diff,
+    handle_file_content, handle_org_diff,
+    FileContentRequest, FileContentResponse, OrgDiffRequest, OrgDiffResponse, FileDiff, DiffStatus,
 };
 
 
@@ -44,7 +44,7 @@ use crate::repo_handler::{
         handle_create_db_taskrun,
         handle_db_taskrun_logs,
         handle_file_content,
-        handle_diff,
+        handle_org_diff,
     ),
     components(schemas(
         AddMemberRequest,
@@ -59,7 +59,7 @@ use crate::repo_handler::{
         DbTaskRunLogsRequest,
         TaskRunLogsResponse,
         FileContentRequest, FileContentResponse,
-        DiffRequest, DiffResponse, FileDiff, DiffStatus,
+        OrgDiffRequest, OrgDiffResponse, FileDiff, DiffStatus,
     )),
     modifiers(&SecurityAddon),
 )]
@@ -180,14 +180,14 @@ pub fn build(
         .and(with_state(state.clone()))
         .and_then(handle_file_content);
 
-    let repo_diff = warp::post()
-        .and(warp::path("repo"))
+    let org_diff = warp::post()
+        .and(warp::path("org"))
         .and(warp::path("diff"))
         .and(warp::path::end())
         .and(warp::body::content_length_limit(64 * 1024))
         .and(warp::body::json())
         .and(with_state(state.clone()))
-        .and_then(handle_diff);
+        .and_then(handle_org_diff);
 
     // GET /healthz — no auth, liveness probe must be reachable by k8s
     let health = warp::get()
@@ -222,7 +222,7 @@ pub fn build(
         .or(create_db_taskrun)
         .or(db_taskrun_logs)
         .or(file_content)
-        .or(repo_diff)
+        .or(org_diff)
         .or(health)
         .or(api_doc)
         .or(swagger_ui)
