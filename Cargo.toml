@@ -25,7 +25,7 @@ serde_yaml = "0.9"
 ginger-shared-rs = {version = "0.38.0-nightly.0", organization = "ginger-society"}
 jsonwebtoken = "9.3.0"
 tempfile = "3"
-git2 = "0.19"
+git2 = { version = "0.19", features = ["vendored-openssl"] }
 
 
 [profile.release]
