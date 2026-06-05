@@ -24,9 +24,7 @@ use crate::requests::{
 use crate::state::AppState;
 
 use crate::repo_handler::{
-    __path_handle_file_content, __path_handle_org_diff,
-    handle_file_content, handle_org_diff,
-    FileContentRequest, FileContentResponse, OrgDiffRequest, OrgDiffResponse, FileDiff, DiffStatus,
+    __path_handle_file_content, __path_handle_org_diff, DiffStatus, FileContentRequest, FileContentResponse, FileDiff, OrgDiffRequest, OrgDiffResponse, RepoDiff, handle_file_content, handle_org_diff
 };
 
 
@@ -59,7 +57,7 @@ use crate::repo_handler::{
         DbTaskRunLogsRequest,
         TaskRunLogsResponse,
         FileContentRequest, FileContentResponse,
-        OrgDiffRequest, OrgDiffResponse, FileDiff, DiffStatus,
+        OrgDiffRequest, OrgDiffResponse, FileDiff, DiffStatus, RepoDiff
     )),
     modifiers(&SecurityAddon),
 )]
