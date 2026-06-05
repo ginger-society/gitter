@@ -4,6 +4,13 @@ ARG GINGER_TOKEN
 
 # Create a new directory for the app
 WORKDIR /app
+
+# Install make and other build essentials needed for vendored OpenSSL
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    make \
+    perl \
+    && rm -rf /var/lib/apt/lists/*
+
 COPY . .
 # Run the ginger-auth command and capture the output
 # RUN ginger-auth token-login $GINGER_TOKEN
