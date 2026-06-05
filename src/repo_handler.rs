@@ -1,6 +1,9 @@
 use std::convert::Infallible;
 use std::path::PathBuf;
 
+use git2::{
+    Delta, DiffOptions, MergeOptions, Oid, Repository, Sort,
+};
 use redis::AsyncCommands;
 use tracing::{error, info, warn};
 use warp::http::StatusCode;
@@ -17,14 +20,9 @@ const FILE_CACHE_TTL: u64 = 10; // seconds
 
 #[derive(Debug, serde::Deserialize, utoipa::ToSchema)]
 pub struct FileContentRequest {
-    /// Repository name (without .git suffix)
     pub repo: String,
-
-    /// Branch name OR tag name — exactly one must be provided
     pub branch: Option<String>,
     pub tag: Option<String>,
-
-    /// File path relative to the repo root, e.g. "src/main.rs"
     pub path: String,
 }
 
@@ -34,28 +32,21 @@ pub struct FileContentResponse {
     pub r#ref: String,
     pub path: String,
     pub content: String,
-    /// true when the response was served from Redis cache
     pub cached: bool,
 }
 
-/// Request for an org-wide diff: finds every repo whose name starts with
-/// `{org_id}-` and diffs the named branch (if it exists) against `main`.
 #[derive(Debug, serde::Deserialize, utoipa::ToSchema)]
 pub struct OrgDiffRequest {
     /// Organisation identifier — repos must be named `{org_id}-{anything}`
     pub org_id: String,
-
     /// Branch name to diff against `main` in every matching repo
     pub branch: String,
 }
 
 #[derive(Debug, serde::Serialize, utoipa::ToSchema)]
 pub struct FileDiff {
-    /// Relative file path
     pub path: String,
     pub status: DiffStatus,
-    /// Unified diff for this file (empty for binary files or pure adds/deletes
-    /// without content)
     pub diff: String,
 }
 
@@ -73,7 +64,6 @@ pub enum DiffStatus {
 /// One entry in the org-wide diff response — one per repo that had the branch.
 #[derive(Debug, serde::Serialize, utoipa::ToSchema)]
 pub struct RepoDiff {
-    /// Repo name (without .git suffix), e.g. "acme-backend"
     pub repo: String,
     pub base: String,
     pub head: String,
@@ -86,140 +76,64 @@ pub struct RepoDiff {
 pub struct OrgDiffResponse {
     pub org_id: String,
     pub branch: String,
-    /// Only repos that actually have the branch are included.
     pub repos: Vec<RepoDiff>,
-    /// Repo names that were found but did NOT have the branch — informational.
     pub skipped_repos: Vec<String>,
+}
+
+// ── New: commits endpoint types ───────────────────────────────────────────────
+
+#[derive(Debug, serde::Deserialize, utoipa::ToSchema)]
+pub struct OrgCommitsRequest {
+    pub org_id: String,
+    pub branch: String,
+}
+
+#[derive(Debug, serde::Serialize, utoipa::ToSchema)]
+pub struct BranchCommit {
+    pub sha: String,
+    pub short_sha: String,
+    pub subject: String,       // first line of commit message
+    pub body: String,          // remainder of commit message (may be empty)
+    pub author: String,
+    pub author_email: String,
+    pub timestamp: i64,        // unix epoch seconds (UTC)
+}
+
+#[derive(Debug, serde::Serialize, utoipa::ToSchema)]
+pub struct RepoBranchCommits {
+    pub repo: String,
+    /// Commits reachable from branch HEAD but NOT from merge-base with main,
+    /// ordered newest-first.
+    pub commits: Vec<BranchCommit>,
+    /// Pre-filled suggested squash message:
+    ///   - 1 commit  → that commit's full message
+    ///   - >1 commit → empty string (author must write one)
+    pub suggested_message: String,
+}
+
+#[derive(Debug, serde::Serialize, utoipa::ToSchema)]
+pub struct OrgBranchCommitsResponse {
+    pub org_id: String,
+    pub branch: String,
+    pub repos: Vec<RepoBranchCommits>,
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-/// Resolve the bare-repo path and sanity-check it exists.
-fn repo_git_path(repo: &str) -> anyhow::Result<PathBuf> {
-    let name = repo.trim_end_matches(".git");
+/// Resolve and open a bare repo, rejecting path-traversal attempts.
+fn open_repo(repo_name: &str) -> anyhow::Result<Repository> {
+    let name = repo_name.trim_end_matches(".git");
 
     if name.is_empty() || name.contains('/') || name.contains("..") {
-        anyhow::bail!("invalid repo name: {repo:?}");
+        anyhow::bail!("invalid repo name: {repo_name:?}");
     }
 
     let path = PathBuf::from(REPOS_ROOT).join(format!("{name}.git"));
     if !path.exists() {
         anyhow::bail!("repository '{name}' not found");
     }
-    Ok(path)
-}
 
-/// Run a git command inside `git_dir` (a bare repo) and return stdout.
-async fn git_cmd(git_dir: &PathBuf, args: &[&str]) -> anyhow::Result<String> {
-    let out = tokio::process::Command::new("git")
-        .arg("--git-dir")
-        .arg(git_dir)
-        .args(args)
-        .output()
-        .await?;
-
-    if !out.status.success() {
-        let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
-        anyhow::bail!("git {}: {stderr}", args.join(" "));
-    }
-    Ok(String::from_utf8_lossy(&out.stdout).to_string())
-}
-
-/// Read a single file from a bare repo at the given ref.
-async fn read_file(git_dir: &PathBuf, git_ref: &str, file_path: &str) -> anyhow::Result<String> {
-    let clean: String = file_path
-        .split('/')
-        .filter(|s| !s.is_empty() && *s != "..")
-        .collect::<Vec<_>>()
-        .join("/");
-
-    let object = format!("{git_ref}:{clean}");
-    let content = git_cmd(git_dir, &["cat-file", "blob", &object]).await?;
-    Ok(content)
-}
-
-/// Build the Redis cache key for a file-content request.
-fn cache_key(repo: &str, git_ref: &str, path: &str) -> String {
-    format!("gitter:file:{repo}:{git_ref}:{path}")
-}
-
-/// Core diff logic, shared by the single-repo and org-wide endpoints.
-/// Returns `None` if the branch does not exist in `git_dir`.
-async fn diff_repo(git_dir: &PathBuf, repo_name: &str, branch: &str) -> Option<RepoDiff> {
-    // Check both required refs exist; bail silently if the branch is absent.
-    if git_cmd(git_dir, &["rev-parse", "--verify", "main"]).await.is_err() {
-        warn!("[diff] repo {repo_name}: 'main' ref not found — skipping");
-        return None;
-    }
-    if git_cmd(git_dir, &["rev-parse", "--verify", branch]).await.is_err() {
-        // Branch simply doesn't exist in this repo — not an error.
-        return None;
-    }
-
-    // name-status diff (three-dot = from merge-base)
-    let name_status = match git_cmd(
-        git_dir,
-        &["diff", "--name-status", &format!("main...{branch}")],
-    )
-    .await
-    {
-        Ok(s) => s,
-        Err(e) => {
-            error!("[git] diff --name-status failed for {repo_name}: {e:#}");
-            return None;
-        }
-    };
-
-    let mut files: Vec<FileDiff> = Vec::new();
-
-    for line in name_status.lines().filter(|l| !l.trim().is_empty()) {
-        let mut parts = line.splitn(2, '\t');
-        let status_char = parts.next().unwrap_or("?").trim();
-        let file_path = parts.next().unwrap_or("").trim().to_string();
-
-        if file_path.is_empty() {
-            continue;
-        }
-
-        let status = match status_char.chars().next().unwrap_or('?') {
-            'A' => DiffStatus::Added,
-            'M' => DiffStatus::Modified,
-            'D' => DiffStatus::Deleted,
-            'R' => DiffStatus::Renamed,
-            'C' => DiffStatus::Copied,
-            _   => DiffStatus::Unknown,
-        };
-
-        let diff = git_cmd(
-            git_dir,
-            &[
-                "diff",
-                "--unified=3",
-                &format!("main...{branch}"),
-                "--",
-                &file_path,
-            ],
-        )
-        .await
-        .unwrap_or_else(|e| {
-            warn!("[git] per-file diff failed for {file_path} in {repo_name}: {e:#}");
-            String::new()
-        });
-
-        files.push(FileDiff { path: file_path, status, diff });
-    }
-
-    let (has_merge_conflicts, conflicting_files) =
-        detect_conflicts(git_dir, branch).await;
-
-    Some(RepoDiff {
-        repo: repo_name.to_string(),
-        base: "main".into(),
-        head: branch.to_string(),
-        files,
-        has_merge_conflicts,
-        conflicting_files,
-    })
+    Ok(Repository::open_bare(&path)?)
 }
 
 /// Enumerate every `<org_id>-*.git` directory under REPOS_ROOT.
@@ -233,14 +147,280 @@ fn list_org_repos(org_id: &str) -> anyhow::Result<Vec<String>> {
         let fname = fname.to_string_lossy();
 
         if fname.starts_with(&prefix) && fname.ends_with(".git") {
-            // Strip the trailing ".git" to get the canonical repo name.
-            let name = fname.trim_end_matches(".git").to_string();
-            names.push(name);
+            names.push(fname.trim_end_matches(".git").to_string());
         }
     }
 
-    names.sort(); // deterministic ordering in the response
+    names.sort();
     Ok(names)
+}
+
+fn cache_key(repo: &str, git_ref: &str, path: &str) -> String {
+    format!("gitter:file:{repo}:{git_ref}:{path}")
+}
+
+// ── Core git logic ────────────────────────────────────────────────────────────
+
+/// Read a single file from a bare repo at the given ref.
+fn read_file_from_repo(repo: &Repository, git_ref: &str, file_path: &str) -> anyhow::Result<String> {
+    let clean: String = file_path
+        .split('/')
+        .filter(|s| !s.is_empty() && *s != "..")
+        .collect::<Vec<_>>()
+        .join("/");
+
+    let obj = repo.revparse_single(&format!("{git_ref}:{clean}"))?;
+    let blob = obj.peel_to_blob()?;
+    Ok(String::from_utf8_lossy(blob.content()).to_string())
+}
+
+/// Resolve a branch name to its tip commit Oid.
+/// Returns None if the branch does not exist.
+fn resolve_branch(repo: &Repository, branch: &str) -> Option<Oid> {
+    repo.find_branch(branch, git2::BranchType::Local)
+        .ok()
+        .and_then(|b| b.get().target())
+}
+
+/// Find the merge-base between main and branch.
+fn find_merge_base(repo: &Repository, main_oid: Oid, branch_oid: Oid) -> anyhow::Result<Oid> {
+    Ok(repo.merge_base(main_oid, branch_oid)?)
+}
+
+/// Core diff logic. Returns None if branch does not exist in this repo.
+fn diff_repo(repo: &Repository, repo_name: &str, branch: &str) -> Option<RepoDiff> {
+    let main_oid = repo
+        .find_branch("main", git2::BranchType::Local)
+        .ok()?
+        .get()
+        .target()?;
+
+    let branch_oid = resolve_branch(repo, branch)?;
+
+    let base_oid = match find_merge_base(repo, main_oid, branch_oid) {
+        Ok(o) => o,
+        Err(e) => {
+            warn!("[diff] merge_base failed for {repo_name}: {e:#}");
+            return None;
+        }
+    };
+
+    let base_commit = repo.find_commit(base_oid).ok()?;
+    let branch_commit = repo.find_commit(branch_oid).ok()?;
+
+    let base_tree = base_commit.tree().ok()?;
+    let branch_tree = branch_commit.tree().ok()?;
+
+    let mut diff_opts = DiffOptions::new();
+    diff_opts.context_lines(3);
+
+    let diff = match repo.diff_tree_to_tree(
+        Some(&base_tree),
+        Some(&branch_tree),
+        Some(&mut diff_opts),
+    ) {
+        Ok(d) => d,
+        Err(e) => {
+            error!("[diff] diff_tree_to_tree failed for {repo_name}: {e:#}");
+            return None;
+        }
+    };
+
+    let mut files: Vec<FileDiff> = Vec::new();
+
+    // Collect per-file patches
+    let _ = diff.print(git2::DiffFormat::Patch, |delta, _hunk, line| {
+        // We rebuild per-file diffs by walking the patch output
+        // using diff.foreach below instead — this closure is unused
+        true
+    });
+
+    // Use foreach for structured access
+    let mut current_path = String::new();
+    let mut current_status = DiffStatus::Unknown;
+    let mut current_diff = String::new();
+
+    let _ = diff.print(git2::DiffFormat::Patch, |delta, _hunk, line| {
+        let path = delta
+            .new_file()
+            .path()
+            .or_else(|| delta.old_file().path())
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_default();
+
+        // Flush previous file when path changes
+        if !current_path.is_empty() && path != current_path {
+            files.push(FileDiff {
+                path: current_path.clone(),
+                status: std::mem::replace(&mut current_status, DiffStatus::Unknown),
+                diff: std::mem::take(&mut current_diff),
+            });
+        }
+
+        if path != current_path {
+            current_path = path;
+            current_status = match delta.status() {
+                Delta::Added    => DiffStatus::Added,
+                Delta::Deleted  => DiffStatus::Deleted,
+                Delta::Modified => DiffStatus::Modified,
+                Delta::Renamed  => DiffStatus::Renamed,
+                Delta::Copied   => DiffStatus::Copied,
+                _               => DiffStatus::Unknown,
+            };
+        }
+
+        if let Ok(content) = std::str::from_utf8(line.content()) {
+            current_diff.push_str(content);
+        }
+
+        true
+    });
+
+    // Flush last file
+    if !current_path.is_empty() {
+        files.push(FileDiff {
+            path: current_path,
+            status: current_status,
+            diff: current_diff,
+        });
+    }
+
+    let (has_merge_conflicts, conflicting_files) = detect_conflicts(repo, main_oid, branch_oid);
+
+    Some(RepoDiff {
+        repo: repo_name.to_string(),
+        base: "main".into(),
+        head: branch.to_string(),
+        files,
+        has_merge_conflicts,
+        conflicting_files,
+    })
+}
+
+/// Returns commits reachable from branch_oid but not from merge-base with main,
+/// newest first. This is equivalent to `git log main..branch`.
+fn commits_since_branch(
+    repo: &Repository,
+    repo_name: &str,
+    branch: &str,
+) -> Option<RepoBranchCommits> {
+    let main_oid = repo
+        .find_branch("main", git2::BranchType::Local)
+        .ok()?
+        .get()
+        .target()?;
+
+    let branch_oid = resolve_branch(repo, branch)?;
+
+    let base_oid = match find_merge_base(repo, main_oid, branch_oid) {
+        Ok(o) => o,
+        Err(e) => {
+            warn!("[commits] merge_base failed for {repo_name}: {e:#}");
+            return None;
+        }
+    };
+
+    let mut revwalk = repo.revwalk().ok()?;
+    revwalk.set_sorting(Sort::TIME).ok()?;
+    revwalk.push(branch_oid).ok()?;
+    revwalk.hide(base_oid).ok()?;
+
+    let commits: Vec<BranchCommit> = revwalk
+        .filter_map(|oid| {
+            let oid = oid.ok()?;
+            let commit = repo.find_commit(oid).ok()?;
+
+            let full_message = commit.message().unwrap_or("").to_string();
+            let mut lines = full_message.splitn(2, '\n');
+            let subject = lines.next().unwrap_or("").trim().to_string();
+            let body = lines.next().unwrap_or("").trim_start_matches('\n').to_string();
+
+            Some(BranchCommit {
+                sha: oid.to_string(),
+                short_sha: oid.to_string()[..7].to_string(),
+                subject,
+                body,
+                author: commit.author().name().unwrap_or("").to_string(),
+                author_email: commit.author().email().unwrap_or("").to_string(),
+                timestamp: commit.time().seconds(),
+            })
+        })
+        .collect();
+
+    // Pre-fill suggested message only when there is exactly one commit —
+    // no guessing needed, the author already wrote it.
+    let suggested_message = if commits.len() == 1 {
+        let c = &commits[0];
+        if c.body.is_empty() {
+            c.subject.clone()
+        } else {
+            format!("{}\n\n{}", c.subject, c.body)
+        }
+    } else {
+        String::new()
+    };
+
+    Some(RepoBranchCommits {
+        repo: repo_name.to_string(),
+        commits,
+        suggested_message,
+    })
+}
+
+/// Detect merge conflicts using git2's in-memory merge.
+fn detect_conflicts(
+    repo: &Repository,
+    main_oid: Oid,
+    branch_oid: Oid,
+) -> (bool, Vec<String>) {
+    // If branch is already an ancestor of main there are no conflicts.
+    if repo.merge_base(main_oid, branch_oid)
+        .map(|base| base == branch_oid)
+        .unwrap_or(false)
+    {
+        return (false, vec![]);
+    }
+
+    let main_commit   = match repo.find_commit(main_oid)   { Ok(c) => c, Err(_) => return (false, vec![]) };
+    let branch_commit = match repo.find_commit(branch_oid) { Ok(c) => c, Err(_) => return (false, vec![]) };
+
+    let main_tree   = match main_commit.tree()   { Ok(t) => t, Err(_) => return (false, vec![]) };
+    let branch_tree = match branch_commit.tree() { Ok(t) => t, Err(_) => return (false, vec![]) };
+
+    let base_oid    = match repo.merge_base(main_oid, branch_oid) { Ok(o) => o, Err(_) => return (false, vec![]) };
+    let base_commit = match repo.find_commit(base_oid)  { Ok(c) => c, Err(_) => return (false, vec![]) };
+    let base_tree   = match base_commit.tree()           { Ok(t) => t, Err(_) => return (false, vec![]) };
+
+    let mut merge_opts = MergeOptions::new();
+    let index = match repo.merge_trees(&base_tree, &main_tree, &branch_tree, Some(&merge_opts)) {
+        Ok(idx) => idx,
+        Err(e) => {
+            warn!("[conflict] merge_trees failed: {e:#}");
+            return (false, vec![]);
+        }
+    };
+
+    if !index.has_conflicts() {
+        return (false, vec![]);
+    }
+
+    let conflicting: Vec<String> = index
+        .conflicts()
+        .map(|conflicts| {
+            conflicts
+                .filter_map(|c| {
+                    let entry = c.ok()?;
+                    // any of ancestor/our/their path will do
+                    let path = entry.our
+                        .or(entry.their)
+                        .or(entry.ancestor)?;
+                    String::from_utf8(path.path).ok()
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    (!conflicting.is_empty(), conflicting)
 }
 
 // ── Handler: POST /repo/file ──────────────────────────────────────────────────
@@ -251,20 +431,19 @@ fn list_org_repos(org_id: &str) -> anyhow::Result<Vec<String>> {
     tag = "default",
     request_body(content = FileContentRequest, content_type = "application/json"),
     responses(
-        (status = 200, description = "File content", body = FileContentResponse),
-        (status = 400, description = "Validation error", body = ApiResponse),
-        (status = 404, description = "Repo or file not found", body = ApiResponse),
-        (status = 500, description = "Internal error", body = ApiResponse),
+        (status = 200, description = "File content",       body = FileContentResponse),
+        (status = 400, description = "Validation error",   body = ApiResponse),
+        (status = 404, description = "Repo/file not found",body = ApiResponse),
+        (status = 500, description = "Internal error",     body = ApiResponse),
     )
 )]
 pub async fn handle_file_content(
     body: FileContentRequest,
     state: AppState,
 ) -> Result<impl warp::Reply, Infallible> {
-    // ── Resolve the ref ───────────────────────────────────────────────────────
     let git_ref = match (&body.branch, &body.tag) {
-        (Some(b), None) => b.clone(),
-        (None, Some(t)) => t.clone(),
+        (Some(b), None)  => b.clone(),
+        (None,  Some(t)) => t.clone(),
         (Some(_), Some(_)) => {
             return Ok(warp::reply::with_status(
                 warp::reply::json(&ApiResponse {
@@ -286,28 +465,13 @@ pub async fn handle_file_content(
     };
 
     if body.repo.trim().is_empty() {
-        return Ok(warp::reply::with_status(
-            warp::reply::json(&ApiResponse {
-                status: "error",
-                message: Some("'repo' must not be empty".into()),
-            }),
-            StatusCode::BAD_REQUEST,
-        ));
+        return Ok(bad_request("'repo' must not be empty"));
     }
     if body.path.trim().is_empty() {
-        return Ok(warp::reply::with_status(
-            warp::reply::json(&ApiResponse {
-                status: "error",
-                message: Some("'path' must not be empty".into()),
-            }),
-            StatusCode::BAD_REQUEST,
-        ));
+        return Ok(bad_request("'path' must not be empty"));
     }
 
-    info!(
-        "POST /repo/file repo={} ref={} path={}",
-        body.repo, git_ref, body.path
-    );
+    info!("POST /repo/file repo={} ref={} path={}", body.repo, git_ref, body.path);
 
     // ── Cache lookup ──────────────────────────────────────────────────────────
     let key = cache_key(&body.repo, &git_ref, &body.path);
@@ -316,61 +480,38 @@ pub async fn handle_file_content(
     match redis.get::<_, Option<String>>(&key).await {
         Ok(Some(cached)) => {
             info!("[cache] HIT {key}");
-            let resp = FileContentResponse {
-                repo: body.repo.clone(),
-                r#ref: git_ref.clone(),
-                path: body.path.clone(),
-                content: cached,
-                cached: true,
-            };
             return Ok(warp::reply::with_status(
-                warp::reply::json(&resp),
+                warp::reply::json(&FileContentResponse {
+                    repo: body.repo,
+                    r#ref: git_ref,
+                    path: body.path,
+                    content: cached,
+                    cached: true,
+                }),
                 StatusCode::OK,
             ));
         }
-        Ok(None) => info!("[cache] MISS {key}"),
-        Err(e) => warn!("[cache] redis error (continuing without cache): {e:#}"),
+        Ok(None)  => info!("[cache] MISS {key}"),
+        Err(e)    => warn!("[cache] redis error (continuing without cache): {e:#}"),
     }
 
     // ── Read from bare repo ───────────────────────────────────────────────────
-    let git_dir = match repo_git_path(&body.repo) {
-        Ok(p) => p,
-        Err(e) => {
-            return Ok(warp::reply::with_status(
-                warp::reply::json(&ApiResponse {
-                    status: "error",
-                    message: Some(e.to_string()),
-                }),
-                StatusCode::NOT_FOUND,
-            ));
-        }
+    let repo = match open_repo(&body.repo) {
+        Ok(r)  => r,
+        Err(e) => return Ok(not_found(e.to_string())),
     };
 
-    let content = match read_file(&git_dir, &git_ref, &body.path).await {
-        Ok(c) => c,
+    let content = match read_file_from_repo(&repo, &git_ref, &body.path) {
+        Ok(c)  => c,
         Err(e) => {
             let msg = e.to_string();
-            let code = if msg.contains("not found") || msg.contains("does not exist") {
-                StatusCode::NOT_FOUND
-            } else {
-                StatusCode::INTERNAL_SERVER_ERROR
-            };
             error!("[git] read_file failed: {msg}");
-            return Ok(warp::reply::with_status(
-                warp::reply::json(&ApiResponse {
-                    status: "error",
-                    message: Some(msg),
-                }),
-                code,
-            ));
+            return Ok(not_found(msg));
         }
     };
 
     // ── Populate cache ────────────────────────────────────────────────────────
-    if let Err(e) = redis
-        .set_ex::<_, _, ()>(&key, &content, FILE_CACHE_TTL)
-        .await
-    {
+    if let Err(e) = redis.set_ex::<_, _, ()>(&key, &content, FILE_CACHE_TTL).await {
         warn!("[cache] failed to write {key}: {e:#}");
     }
 
@@ -387,10 +528,6 @@ pub async fn handle_file_content(
 }
 
 // ── Handler: POST /org/diff ───────────────────────────────────────────────────
-//
-// Scans REPOS_ROOT for every directory named `{org_id}-*.git`, then diffs
-// the requested branch against `main` in each one.  Repos where the branch
-// does not exist are silently skipped and listed in `skipped_repos`.
 
 #[utoipa::path(
     post,
@@ -399,111 +536,57 @@ pub async fn handle_file_content(
     request_body(content = OrgDiffRequest, content_type = "application/json"),
     responses(
         (status = 200, description = "Org-wide diff result", body = OrgDiffResponse),
-        (status = 400, description = "Validation error", body = ApiResponse),
-        (status = 500, description = "Internal error", body = ApiResponse),
+        (status = 400, description = "Validation error",     body = ApiResponse),
+        (status = 500, description = "Internal error",       body = ApiResponse),
     )
 )]
 pub async fn handle_org_diff(
     body: OrgDiffRequest,
     _state: AppState,
 ) -> Result<impl warp::Reply, Infallible> {
-    if body.org_id.trim().is_empty() {
-        return Ok(warp::reply::with_status(
-            warp::reply::json(&ApiResponse {
-                status: "error",
-                message: Some("'org_id' must not be empty".into()),
-            }),
-            StatusCode::BAD_REQUEST,
-        ));
-    }
-    if body.branch.trim().is_empty() {
-        return Ok(warp::reply::with_status(
-            warp::reply::json(&ApiResponse {
-                status: "error",
-                message: Some("'branch' must not be empty".into()),
-            }),
-            StatusCode::BAD_REQUEST,
-        ));
-    }
-    if body.branch == "main" {
-        return Ok(warp::reply::with_status(
-            warp::reply::json(&ApiResponse {
-                status: "error",
-                message: Some("'branch' must not be 'main' — diff is always against main".into()),
-            }),
-            StatusCode::BAD_REQUEST,
-        ));
-    }
-    // Reject org_id values that could escape the prefix match (e.g. "../other")
-    if body.org_id.contains('/') || body.org_id.contains("..") {
-        return Ok(warp::reply::with_status(
-            warp::reply::json(&ApiResponse {
-                status: "error",
-                message: Some("'org_id' contains invalid characters".into()),
-            }),
-            StatusCode::BAD_REQUEST,
-        ));
+    if let Err(r) = validate_org_branch(&body.org_id, &body.branch) {
+        return Ok(r);
     }
 
-    info!(
-        "POST /org/diff org_id={} branch={} vs main",
-        body.org_id, body.branch
-    );
+    info!("POST /org/diff org_id={} branch={} vs main", body.org_id, body.branch);
 
-    // Enumerate repos belonging to this org
     let repo_names = match list_org_repos(&body.org_id) {
-        Ok(v) => v,
+        Ok(v)  => v,
         Err(e) => {
             error!("[org/diff] failed to list repos: {e:#}");
-            return Ok(warp::reply::with_status(
-                warp::reply::json(&ApiResponse {
-                    status: "error",
-                    message: Some(format!("failed to enumerate repositories: {e}")),
-                }),
-                StatusCode::INTERNAL_SERVER_ERROR,
-            ));
+            return Ok(internal_error(format!("failed to enumerate repositories: {e}")));
         }
     };
 
     info!(
         "[org/diff] found {} repo(s) for org '{}': {:?}",
-        repo_names.len(),
-        body.org_id,
-        repo_names
+        repo_names.len(), body.org_id, repo_names
     );
 
-    let mut repos: Vec<RepoDiff> = Vec::new();
-    let mut skipped_repos: Vec<String> = Vec::new();
-
-    // Run diffs concurrently — one task per repo
     let mut handles = Vec::with_capacity(repo_names.len());
-
     for repo_name in repo_names {
         let branch = body.branch.clone();
-        handles.push(tokio::spawn(async move {
-            // repo_git_path is infallible here because list_org_repos already
-            // confirmed the directory exists; we just need the PathBuf.
-            let git_dir = match repo_git_path(&repo_name) {
-                Ok(p) => p,
-                Err(e) => {
-                    warn!("[org/diff] repo_git_path({repo_name}) failed: {e:#}");
-                    return (repo_name, None);
-                }
+        handles.push(tokio::task::spawn_blocking(move || {
+            let repo = match open_repo(&repo_name) {
+                Ok(r)  => r,
+                Err(e) => { warn!("[org/diff] open_repo({repo_name}) failed: {e:#}"); return (repo_name, None); }
             };
-            let result = diff_repo(&git_dir, &repo_name, &branch).await;
+            let result = diff_repo(&repo, &repo_name, &branch);
             (repo_name, result)
         }));
     }
 
+    let mut repos: Vec<RepoDiff> = Vec::new();
+    let mut skipped_repos: Vec<String> = Vec::new();
+
     for handle in handles {
         match handle.await {
-            Ok((repo_name, Some(diff))) => repos.push(diff),
-            Ok((repo_name, None))       => skipped_repos.push(repo_name),
-            Err(e) => error!("[org/diff] task panicked: {e:#}"),
+            Ok((_, Some(diff))) => repos.push(diff),
+            Ok((name, None))    => skipped_repos.push(name),
+            Err(e)              => error!("[org/diff] task panicked: {e:#}"),
         }
     }
 
-    // Keep a consistent order
     repos.sort_by(|a, b| a.repo.cmp(&b.repo));
     skipped_repos.sort();
 
@@ -518,82 +601,109 @@ pub async fn handle_org_diff(
     ))
 }
 
-// ── Conflict detection ────────────────────────────────────────────────────────
+// ── Handler: POST /org/commits ────────────────────────────────────────────────
 
-async fn detect_conflicts(git_dir: &PathBuf, branch: &str) -> (bool, Vec<String>) {
-    // Fast path: if the branch is already an ancestor of main there are no conflicts.
-    if git_cmd(git_dir, &["merge-base", "--is-ancestor", branch, "main"])
-        .await
-        .is_ok()
-    {
-        return (false, vec![]);
-    }
-
-    let main_sha = match git_cmd(git_dir, &["rev-parse", "main"]).await {
-        Ok(s) => s.trim().to_string(),
-        Err(e) => {
-            warn!("[conflict] could not resolve main SHA: {e:#}");
-            return (false, vec![]);
-        }
-    };
-    let branch_sha = match git_cmd(git_dir, &["rev-parse", branch]).await {
-        Ok(s) => s.trim().to_string(),
-        Err(e) => {
-            warn!("[conflict] could not resolve branch SHA: {e:#}");
-            return (false, vec![]);
-        }
-    };
-    let merge_base = match git_cmd(git_dir, &["merge-base", &main_sha, &branch_sha]).await {
-        Ok(s) => s.trim().to_string(),
-        Err(e) => {
-            warn!("[conflict] merge-base failed: {e:#}");
-            return (false, vec![]);
-        }
-    };
-
-    let merge_tree_out = match git_cmd(
-        git_dir,
-        &["merge-tree", &merge_base, &main_sha, &branch_sha],
+#[utoipa::path(
+    post,
+    path = "/org/commits",
+    tag = "default",
+    request_body(content = OrgCommitsRequest, content_type = "application/json"),
+    responses(
+        (status = 200, description = "Commits per repo since branch point", body = OrgBranchCommitsResponse),
+        (status = 400, description = "Validation error",                    body = ApiResponse),
+        (status = 500, description = "Internal error",                      body = ApiResponse),
     )
-    .await
-    {
-        Ok(s) => s,
+)]
+pub async fn handle_org_commits(
+    body: OrgCommitsRequest,
+    _state: AppState,
+) -> Result<impl warp::Reply, Infallible> {
+    if let Err(r) = validate_org_branch(&body.org_id, &body.branch) {
+        return Ok(r);
+    }
+
+    info!("POST /org/commits org_id={} branch={}", body.org_id, body.branch);
+
+    let repo_names = match list_org_repos(&body.org_id) {
+        Ok(v)  => v,
         Err(e) => {
-            warn!("[conflict] merge-tree failed: {e:#}");
-            return (false, vec![]);
+            error!("[org/commits] failed to list repos: {e:#}");
+            return Ok(internal_error(format!("failed to enumerate repositories: {e}")));
         }
     };
 
-    if !merge_tree_out.contains("<<<<<<<") {
-        return (false, vec![]);
+    let mut handles = Vec::with_capacity(repo_names.len());
+    for repo_name in repo_names {
+        let branch = body.branch.clone();
+        handles.push(tokio::task::spawn_blocking(move || {
+            let repo = match open_repo(&repo_name) {
+                Ok(r)  => r,
+                Err(e) => { warn!("[org/commits] open_repo({repo_name}) failed: {e:#}"); return (repo_name, None); }
+            };
+            let result = commits_since_branch(&repo, &repo_name, &branch);
+            (repo_name, result)
+        }));
     }
 
-    let mut conflicting: Vec<String> = Vec::new();
-    let mut in_conflict_block = false;
-
-    for line in merge_tree_out.lines() {
-        if line.starts_with("changed in both") || line.starts_with("added in both") {
-            in_conflict_block = true;
-            continue;
-        }
-        if in_conflict_block {
-            let trimmed = line.trim();
-            if trimmed.starts_with("base")
-                || trimmed.starts_with("our")
-                || trimmed.starts_with("their")
-            {
-                if let Some(path) = trimmed.split_whitespace().last() {
-                    let p = path.to_string();
-                    if !conflicting.contains(&p) {
-                        conflicting.push(p);
-                    }
-                }
-            } else {
-                in_conflict_block = false;
-            }
+    let mut repos: Vec<RepoBranchCommits> = Vec::new();
+    for handle in handles {
+        match handle.await {
+            Ok((_, Some(r))) => repos.push(r),
+            Ok((name, None)) => info!("[org/commits] {name} skipped (branch absent)"),
+            Err(e)           => error!("[org/commits] task panicked: {e:#}"),
         }
     }
 
-    conflicting.dedup();
-    (!conflicting.is_empty() || merge_tree_out.contains("<<<<<<<"), conflicting)
+    repos.sort_by(|a, b| a.repo.cmp(&b.repo));
+
+    Ok(warp::reply::with_status(
+        warp::reply::json(&OrgBranchCommitsResponse {
+            org_id: body.org_id,
+            branch: body.branch,
+            repos,
+        }),
+        StatusCode::OK,
+    ))
+}
+
+// ── Small reply helpers ───────────────────────────────────────────────────────
+
+type JsonReply = warp::reply::WithStatus<warp::reply::Json>;
+
+fn bad_request(msg: impl Into<String>) -> JsonReply {
+    warp::reply::with_status(
+        warp::reply::json(&ApiResponse { status: "error", message: Some(msg.into()) }),
+        StatusCode::BAD_REQUEST,
+    )
+}
+
+fn not_found(msg: impl Into<String>) -> JsonReply {
+    warp::reply::with_status(
+        warp::reply::json(&ApiResponse { status: "error", message: Some(msg.into()) }),
+        StatusCode::NOT_FOUND,
+    )
+}
+
+fn internal_error(msg: impl Into<String>) -> JsonReply {
+    warp::reply::with_status(
+        warp::reply::json(&ApiResponse { status: "error", message: Some(msg.into()) }),
+        StatusCode::INTERNAL_SERVER_ERROR,
+    )
+}
+
+/// Shared validation for org_id + branch used by both org endpoints.
+fn validate_org_branch(org_id: &str, branch: &str) -> Result<(), JsonReply> {
+    if org_id.trim().is_empty() {
+        return Err(bad_request("'org_id' must not be empty"));
+    }
+    if org_id.contains('/') || org_id.contains("..") {
+        return Err(bad_request("'org_id' contains invalid characters"));
+    }
+    if branch.trim().is_empty() {
+        return Err(bad_request("'branch' must not be empty"));
+    }
+    if branch == "main" {
+        return Err(bad_request("'branch' must not be 'main' — diff is always against main"));
+    }
+    Ok(())
 }
