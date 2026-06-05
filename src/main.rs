@@ -12,6 +12,7 @@ mod auth_helpers;
 mod auth_schemas;
 mod handler_create_db_taskrun;
 mod kubectl_async;
+mod repo_handler;
 
 
 use anyhow::Result;

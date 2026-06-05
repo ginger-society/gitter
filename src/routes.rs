@@ -23,6 +23,13 @@ use crate::requests::{
 };
 use crate::state::AppState;
 
+use crate::repo_handler::{
+    __path_handle_file_content, __path_handle_diff,
+    handle_file_content, handle_diff,
+    FileContentRequest, FileContentResponse, DiffRequest, DiffResponse, FileDiff, DiffStatus,
+};
+
+
 // ── OpenAPI document ──────────────────────────────────────────────────────────
 
 #[derive(OpenApi)]
@@ -35,7 +42,9 @@ use crate::state::AppState;
         handle_update_tekton_kubeconfig,
         handle_update_pipeline_token,
         handle_create_db_taskrun,
-        handle_db_taskrun_logs
+        handle_db_taskrun_logs,
+        handle_file_content,
+        handle_diff,
     ),
     components(schemas(
         AddMemberRequest,
@@ -48,7 +57,9 @@ use crate::state::AppState;
         CreateDbTaskRunRequest,
         TaskRunCreateResponse,
         DbTaskRunLogsRequest,
-        TaskRunLogsResponse
+        TaskRunLogsResponse,
+        FileContentRequest, FileContentResponse,
+        DiffRequest, DiffResponse, FileDiff, DiffStatus,
     )),
     modifiers(&SecurityAddon),
 )]
@@ -159,6 +170,25 @@ pub fn build(
         .and(with_state(state.clone()))
         .and_then(handle_db_taskrun_logs);
 
+    // in build():
+    let file_content = warp::post()
+        .and(warp::path("repo"))
+        .and(warp::path("file"))
+        .and(warp::path::end())
+        .and(warp::body::content_length_limit(64 * 1024))
+        .and(warp::body::json())
+        .and(with_state(state.clone()))
+        .and_then(handle_file_content);
+
+    let repo_diff = warp::post()
+        .and(warp::path("repo"))
+        .and(warp::path("diff"))
+        .and(warp::path::end())
+        .and(warp::body::content_length_limit(64 * 1024))
+        .and(warp::body::json())
+        .and(with_state(state.clone()))
+        .and_then(handle_diff);
+
     // GET /healthz — no auth, liveness probe must be reachable by k8s
     let health = warp::get()
         .and(warp::path("healthz"))
@@ -191,6 +221,8 @@ pub fn build(
         .or(pipeline_token)
         .or(create_db_taskrun)
         .or(db_taskrun_logs)
+        .or(file_content)
+        .or(repo_diff)
         .or(health)
         .or(api_doc)
         .or(swagger_ui)
