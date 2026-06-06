@@ -17,6 +17,7 @@ const REPOS_ROOT: &str = "/home/git/repositories";
 const FILE_CACHE_TTL: u64 = 10; // seconds
 
 // ── Request / Response types ──────────────────────────────────────────────────
+// ── Updated request ───────────────────────────────────────────────────────────
 
 #[derive(Debug, serde::Deserialize, utoipa::ToSchema)]
 pub struct FileContentRequest {
@@ -24,7 +25,22 @@ pub struct FileContentRequest {
     pub branch: Option<String>,
     pub tag: Option<String>,
     pub path: String,
+    /// When true, the response includes `lines` with per-line syntax-highlighted HTML.
+    #[serde(default)]
+    pub highlight: bool,
 }
+
+// ── New struct ────────────────────────────────────────────────────────────────
+
+#[derive(Debug, serde::Serialize, utoipa::ToSchema)]
+pub struct HighlightedLine {
+    pub lineno: u32,
+    pub content: String,
+    pub highlighted_light: String,
+    pub highlighted_dark: String,
+}
+
+// ── Updated response ──────────────────────────────────────────────────────────
 
 #[derive(Debug, serde::Serialize, utoipa::ToSchema)]
 pub struct FileContentResponse {
@@ -33,6 +49,8 @@ pub struct FileContentResponse {
     pub path: String,
     pub content: String,
     pub cached: bool,
+    /// Populated only when the request had `highlight: true`.
+    pub lines: Option<Vec<HighlightedLine>>,
 }
 
 #[derive(Debug, serde::Deserialize, utoipa::ToSchema)]
@@ -205,7 +223,7 @@ fn resolve_extension(path: &str) -> &str {
         .unwrap_or("txt");
 
     match ext {
-        "tsx" | "jsx" => "js", 
+        "ts" | "tsx" | "jsx" => "js",
         "scss" | "sass" => "css",
         "jsonc" => "json",
         "toml" => "toml",
@@ -532,6 +550,7 @@ pub async fn handle_file_content(
                     path: body.path,
                     content: cached,
                     cached: true,
+                    lines: None,
                 }),
                 StatusCode::OK,
             ));
@@ -560,6 +579,33 @@ pub async fn handle_file_content(
         warn!("[cache] failed to write {key}: {e:#}");
     }
 
+    // ── Syntax highlight if requested ─────────────────────────────────────────
+    let lines = if body.highlight {
+        let ext = resolve_extension(&body.path);
+        let highlighted: Vec<HighlightedLine> = content
+            .split('\n')
+            // If the file ends with a newline split produces a trailing empty
+            // string — zip with 1-based line numbers and skip that phantom line.
+            .enumerate()
+            .filter_map(|(i, raw)| {
+                // skip the empty string that comes after a trailing newline
+                if i > 0 && raw.is_empty() {
+                    return None;
+                }
+                let (light, dark) = state.0.highlighter.highlight_line(raw, ext);
+                Some(HighlightedLine {
+                    lineno: (i + 1) as u32,
+                    content: raw.to_string(),
+                    highlighted_light: light,
+                    highlighted_dark: dark,
+                })
+            })
+            .collect();
+        Some(highlighted)
+    } else {
+        None
+    };
+
     Ok(warp::reply::with_status(
         warp::reply::json(&FileContentResponse {
             repo: body.repo,
@@ -567,6 +613,7 @@ pub async fn handle_file_content(
             path: body.path,
             content,
             cached: false,
+            lines,
         }),
         StatusCode::OK,
     ))

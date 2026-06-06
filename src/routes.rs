@@ -23,7 +23,7 @@ use crate::requests::{
 };
 use crate::state::AppState;
 use crate::repo_handler::{
-    __path_handle_file_content, __path_handle_org_commits, __path_handle_org_diff, __path_handle_squash, BranchCommit, DiffLine, DiffStatus, FileContentRequest, FileContentResponse, FileDiff, OrgBranchCommitsResponse, OrgCommitsRequest, OrgDiffRequest, OrgDiffResponse, RepoBranchCommits, RepoDiff, handle_file_content, handle_org_commits, handle_org_diff, handle_squash
+    __path_handle_file_content, __path_handle_org_commits, __path_handle_org_diff, __path_handle_squash, BranchCommit, DiffLine, DiffStatus, FileContentRequest, FileContentResponse, FileDiff, OrgBranchCommitsResponse, OrgCommitsRequest, OrgDiffRequest, OrgDiffResponse, RepoBranchCommits, RepoDiff, handle_file_content, handle_org_commits, handle_org_diff, handle_squash, HighlightedLine
 };
 
 // ── OpenAPI document ──────────────────────────────────────────────────────────
@@ -70,6 +70,7 @@ use crate::repo_handler::{
         DiffLine,
         SquashRequest,         
         SquashResponse, 
+        HighlightedLine
     )),
     modifiers(&SecurityAddon),
 )]
