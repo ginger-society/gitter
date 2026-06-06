@@ -212,6 +212,23 @@ fn escape_html(s: &str) -> String {
      .replace('>', "&gt;")
 }
 
+fn resolve_extension(path: &str) -> &str {
+    let ext = std::path::Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("txt");
+
+    // syntect doesn't have tsx/jsx — fall back to js which it does have
+    match ext {
+        "tsx" | "jsx" => "js",
+        "scss" | "sass" => "css",
+        "jsonc" => "json",
+        "toml" => "toml",  // this one is built in
+        "lock" => "txt",
+        _ => ext,
+    }
+}
+
 /// Core diff logic. Returns None if branch does not exist in this repo.
 fn diff_repo(repo: &Repository, repo_name: &str, branch: &str, highlighter: &crate::state::HighlighterState) -> Option<RepoDiff> {
     let main_oid = repo
@@ -294,10 +311,8 @@ fn diff_repo(repo: &Repository, repo_name: &str, branch: &str, highlighter: &cra
                     current_diff.push(origin);
                     current_diff.push_str(content);
 
-                    let ext = std::path::Path::new(&current_path)
-                        .extension()
-                        .and_then(|e| e.to_str())
-                        .unwrap_or("txt");
+                    let ext = resolve_extension(&current_path);
+
 
                     let trimmed = content.trim_end_matches('\n');
                     let (highlighted_light, highlighted_dark) =

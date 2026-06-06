@@ -20,6 +20,10 @@ impl HighlighterState {
         let light_theme = theme_set.themes["InspiredGitHub"].clone();
         let dark_theme = theme_set.themes["base16-ocean.dark"].clone();
 
+        for syntax in syntax_set.syntaxes() {
+            tracing::info!("Syntax: {} -> {:?}", syntax.name, syntax.file_extensions);
+        }
+
         Self {
             syntax_set,
             light_theme,
