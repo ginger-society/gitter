@@ -218,12 +218,10 @@ fn resolve_extension(path: &str) -> &str {
         .and_then(|e| e.to_str())
         .unwrap_or("txt");
 
-    // syntect doesn't have tsx/jsx — fall back to js which it does have
     match ext {
-        "tsx" | "jsx" => "js",
         "scss" | "sass" => "css",
         "jsonc" => "json",
-        "toml" => "toml",  // this one is built in
+        "toml" => "toml",
         "lock" => "txt",
         _ => ext,
     }

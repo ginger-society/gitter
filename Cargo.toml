@@ -31,6 +31,8 @@ syntect = { version = "=5.2.0", default-features = false, features = [
     "default-themes",
     "html",
     "regex-fancy",
+    "parsing",
+    "yaml-load"
 ] }
 fancy-regex = "=0.13.0"
 
