@@ -26,7 +26,13 @@ ginger-shared-rs = {version = "0.38.0-nightly.0", organization = "ginger-society
 jsonwebtoken = "9.3.0"
 tempfile = "3"
 git2 = { version = "0.19", features = ["vendored-libgit2", "vendored-openssl"] }
-
+syntect = { version = "=5.2.0", default-features = false, features = [
+    "default-syntaxes",
+    "default-themes",
+    "html",
+    "regex-fancy",
+] }
+fancy-regex = "=0.13.0"
 
 [profile.release]
 opt-level = 3
