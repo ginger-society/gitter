@@ -18,13 +18,25 @@ use crate::handler_create_db_taskrun::{
     __path_handle_create_db_taskrun, __path_handle_db_taskrun_logs,
     handle_create_db_taskrun, handle_db_taskrun_logs,
 };
+use crate::merge_queue_handler::{
+    __path_handle_merge_queue, handle_merge_queue,
+    MergeQueueConflict, MergeQueueRequest, MergeQueueResponse,
+};
+use crate::rabbit::RabbitPoolRef;
 use crate::requests::{
-    AddMemberRequest, ApiResponse, CreateDbTaskRunRequest, DbTaskRunLogsRequest, KubeconfigRequest, MemberTypeDto, RemoveMemberRequest, SquashRequest, SquashResponse, TaskRunCreateResponse, TaskRunLogsResponse, UpdatePipelineTokenRequest, UpdateTektonKubeconfigRequest
+    AddMemberRequest, ApiResponse, CreateDbTaskRunRequest, DbTaskRunLogsRequest,
+    KubeconfigRequest, MemberTypeDto, RemoveMemberRequest, SquashRequest, SquashResponse,
+    TaskRunCreateResponse, TaskRunLogsResponse, UpdatePipelineTokenRequest,
+    UpdateTektonKubeconfigRequest,
+};
+use crate::repo_handler::{
+    __path_handle_file_content, __path_handle_org_commits, __path_handle_org_diff,
+    __path_handle_squash, BranchCommit, DiffLine, DiffStatus, FileContentRequest,
+    FileContentResponse, FileDiff, HighlightedLine, OrgBranchCommitsResponse, OrgCommitsRequest,
+    OrgDiffRequest, OrgDiffResponse, RepoBranchCommits, RepoDiff, handle_file_content,
+    handle_org_commits, handle_org_diff, handle_squash,
 };
 use crate::state::AppState;
-use crate::repo_handler::{
-    __path_handle_file_content, __path_handle_org_commits, __path_handle_org_diff, __path_handle_squash, BranchCommit, DiffLine, DiffStatus, FileContentRequest, FileContentResponse, FileDiff, OrgBranchCommitsResponse, OrgCommitsRequest, OrgDiffRequest, OrgDiffResponse, RepoBranchCommits, RepoDiff, handle_file_content, handle_org_commits, handle_org_diff, handle_squash, HighlightedLine
-};
 
 // ── OpenAPI document ──────────────────────────────────────────────────────────
 
@@ -42,7 +54,8 @@ use crate::repo_handler::{
         handle_file_content,
         handle_org_diff,
         handle_org_commits,
-        handle_squash
+        handle_squash,
+        handle_merge_queue,
     ),
     components(schemas(
         AddMemberRequest,
@@ -68,9 +81,12 @@ use crate::repo_handler::{
         RepoBranchCommits,
         BranchCommit,
         DiffLine,
-        SquashRequest,         
-        SquashResponse, 
-        HighlightedLine
+        SquashRequest,
+        SquashResponse,
+        HighlightedLine,
+        MergeQueueRequest,
+        MergeQueueResponse,
+        MergeQueueConflict,
     )),
     modifiers(&SecurityAddon),
 )]
@@ -84,10 +100,17 @@ fn with_state(
     warp::any().map(move || state.clone())
 }
 
+fn with_rabbit(
+    rabbit: RabbitPoolRef,
+) -> impl Filter<Extract = (RabbitPoolRef,), Error = std::convert::Infallible> + Clone {
+    warp::any().map(move || rabbit.clone())
+}
+
 // ── Route assembly ────────────────────────────────────────────────────────────
 
 pub fn build(
     state: AppState,
+    rabbit: RabbitPoolRef,
 ) -> impl Filter<Extract = impl warp::Reply, Error = std::convert::Infallible> + Clone + Send + Sync
 {
     let cors = warp::cors()
@@ -203,12 +226,21 @@ pub fn build(
         .and(with_state(state.clone()))
         .and_then(handle_org_commits);
 
-
+    // POST /repo/squash
     let squash = warp::path!("repo" / "squash")
         .and(warp::post())
         .and(warp::body::json())
         .and(with_state(state.clone()))
         .and_then(handle_squash);
+
+    // POST /repo/merge-queue
+    let merge_queue = warp::path!("repo" / "merge-queue")
+        .and(warp::post())
+        .and(warp::body::content_length_limit(64 * 1024))
+        .and(warp::body::json())
+        .and(with_state(state.clone()))
+        .and(with_rabbit(rabbit))
+        .and_then(handle_merge_queue);
 
     // GET /healthz  — no auth, k8s liveness probe
     let health = warp::get()
@@ -243,6 +275,7 @@ pub fn build(
         .or(org_diff)
         .or(org_commits)
         .or(squash)
+        .or(merge_queue)
         .or(health)
         .or(api_doc)
         .or(swagger_ui)

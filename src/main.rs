@@ -13,7 +13,11 @@ mod auth_schemas;
 mod handler_create_db_taskrun;
 mod kubectl_async;
 mod repo_handler;
+mod rabbit;
+mod merge_queue_handler;
+mod merge_consumer;
 
+use std::sync::Arc;
 
 use anyhow::Result;
 use tokio_cron_scheduler::{Job, JobScheduler};
@@ -22,6 +26,7 @@ use tracing_subscriber::EnvFilter;
 
 use crate::config::Config;
 use crate::git::GitoliteAdmin;
+use crate::rabbit::RabbitPool;
 use crate::redis_lock::spawn_push_worker;
 use crate::state::AppState;
 
@@ -32,7 +37,7 @@ async fn main() -> Result<()> {
             EnvFilter::from_default_env()
                 .add_directive("gitolite_sidecar=debug".parse()?),
         )
-        .with_target(false)       // cleaner lines — no module path spam
+        .with_target(false)
         .with_thread_ids(false)
         .init();
 
@@ -53,6 +58,7 @@ async fn main() -> Result<()> {
     info!("    redis url     : {}", config.redis_url);
     info!("    gh_username   : {}", config.gh_username);
     info!("    gh_ssh_prefix : {}", config.gh_ssh_prefix);
+    info!("    ampq_uri      : {}", config.ampq_uri);
     info!("──────────────────────────────────────────");
 
     // ── Redis ─────────────────────────────────────────────────────────────────
@@ -109,11 +115,20 @@ async fn main() -> Result<()> {
     info!("[backup] ✓ cron registered (fires at :00 of every hour)");
 
     // ── Startup backup ────────────────────────────────────────────────────────
-    info!("[backup] running initial backup on startup …");
-    match backup::run_backup(&state).await {
-        Ok(_)  => info!("[backup] ✓ startup backup complete"),
-        Err(e) => error!("[backup] ✗ startup backup failed: {e:#}"),
-    }
+    // info!("[backup] running initial backup on startup …");
+    // match backup::run_backup(&state).await {
+    //     Ok(_)  => info!("[backup] ✓ startup backup complete"),
+    //     Err(e) => error!("[backup] ✗ startup backup failed: {e:#}"),
+    // }
+
+    // ── RabbitMQ merge queue ──────────────────────────────────────────────────
+    info!("[rabbitmq] connecting to {} …", config.ampq_uri);
+    let rabbit_pool = Arc::new(RabbitPool::new(config.ampq_uri.clone()).await);
+    info!("[rabbitmq] ✓ merge-queue publisher ready");
+
+    // Start the stub consumer — prints each job and releases the Redis lock.
+    merge_consumer::start_merge_consumer(state.clone(), rabbit_pool.clone()).await;
+    info!("[rabbitmq] ✓ merge consumer started");
 
     // ── HTTP server ───────────────────────────────────────────────────────────
     println!();
@@ -123,13 +138,14 @@ async fn main() -> Result<()> {
     info!("  Endpoints");
     info!("    POST http://0.0.0.0:{}/permissions", config.port);
     info!("    POST http://0.0.0.0:{}/kubeconfig", config.port);
+    info!("    POST http://0.0.0.0:{}/repo/merge-queue", config.port);
     info!("    GET  http://0.0.0.0:{}/healthz", config.port);
     info!("    GET  http://0.0.0.0:{}/api-doc.json", config.port);
     info!("    GET  http://0.0.0.0:{}/swagger-ui/", config.port);
     info!("──────────────────────────────────────────");
     println!();
 
-    let routes = routes::build(state);
+    let routes = routes::build(state, rabbit_pool);
     warp::serve(routes).run(([0, 0, 0, 0], config.port)).await;
 
     Ok(())
