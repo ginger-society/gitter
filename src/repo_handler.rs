@@ -198,20 +198,6 @@ fn find_merge_base(repo: &Repository, main_oid: Oid, branch_oid: Oid) -> anyhow:
     Ok(repo.merge_base(main_oid, branch_oid)?)
 }
 
-fn highlight_line(
-    content: &str,
-    extension: &str,
-    highlighter: &crate::state::HighlighterState,
-) -> (String, String) {
-    highlighter.highlight_line(content, extension)
-}
-
-fn escape_html(s: &str) -> String {
-    s.replace('&', "&amp;")
-     .replace('<', "&lt;")
-     .replace('>', "&gt;")
-}
-
 fn resolve_extension(path: &str) -> &str {
     let ext = std::path::Path::new(path)
         .extension()
@@ -219,6 +205,7 @@ fn resolve_extension(path: &str) -> &str {
         .unwrap_or("txt");
 
     match ext {
+        "tsx" | "jsx" => "js", 
         "scss" | "sass" => "css",
         "jsonc" => "json",
         "toml" => "toml",
