@@ -227,15 +227,6 @@ fn diff_repo(repo: &Repository, repo_name: &str, branch: &str) -> Option<RepoDif
     };
 
     let mut files: Vec<FileDiff> = Vec::new();
-
-    // Collect per-file patches
-    let _ = diff.print(git2::DiffFormat::Patch, |delta, _hunk, line| {
-        // We rebuild per-file diffs by walking the patch output
-        // using diff.foreach below instead — this closure is unused
-        true
-    });
-
-    // Use foreach for structured access
     let mut current_path = String::new();
     let mut current_status = DiffStatus::Unknown;
     let mut current_diff = String::new();
@@ -270,13 +261,17 @@ fn diff_repo(repo: &Repository, repo_name: &str, branch: &str) -> Option<RepoDif
         }
 
         if let Ok(content) = std::str::from_utf8(line.content()) {
+            match line.origin() {
+                '+' | '-' | ' ' => current_diff.push(line.origin()),
+                _ => {}
+            }
             current_diff.push_str(content);
         }
 
         true
     });
 
-    // Flush last file
+    // Flush the last file
     if !current_path.is_empty() {
         files.push(FileDiff {
             path: current_path,
