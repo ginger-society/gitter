@@ -8,7 +8,7 @@ use redis::AsyncCommands;
 use tracing::{error, info, warn};
 use warp::http::StatusCode;
 
-use crate::requests::ApiResponse;
+use crate::requests::{ApiResponse, SquashRequest, SquashResponse};
 use crate::state::AppState;
 
 // ── Constants ─────────────────────────────────────────────────────────────────
@@ -768,4 +768,176 @@ fn validate_org_branch(org_id: &str, branch: &str) -> Result<(), JsonReply> {
         return Err(bad_request("'branch' must not be 'main' — diff is always against main"));
     }
     Ok(())
+}
+
+
+// ── Core git logic (add alongside diff_repo / commits_since_branch) ───────────
+
+/// Squash all commits reachable from `branch` but not from the merge-base with
+/// `main` into a single new commit. The branch ref is force-updated to point at
+/// the new commit.
+///
+/// Returns `None` if the branch does not exist in this repo.
+fn squash_branch(
+    repo: &Repository,
+    repo_name: &str,
+    branch: &str,
+    message: &str,
+    author_name_override: Option<&str>,
+    author_email_override: Option<&str>,
+) -> anyhow::Result<SquashResponse> {
+    // ── Resolve OIDs ──────────────────────────────────────────────────────────
+    let main_oid = repo
+        .find_branch("main", git2::BranchType::Local)
+        .map_err(|_| anyhow::anyhow!("'main' branch not found in '{repo_name}'"))?
+        .get()
+        .target()
+        .ok_or_else(|| anyhow::anyhow!("'main' has no tip commit"))?;
+
+    let branch_ref_name = format!("refs/heads/{branch}");
+    let branch_oid = resolve_branch(repo, branch)
+        .ok_or_else(|| anyhow::anyhow!("branch '{branch}' not found in '{repo_name}'"))?;
+
+    let base_oid = find_merge_base(repo, main_oid, branch_oid)
+        .map_err(|e| anyhow::anyhow!("merge_base failed: {e:#}"))?;
+
+    // Count commits being squashed for the response.
+    let mut revwalk = repo.revwalk()?;
+    revwalk.set_sorting(Sort::TIME)?;
+    revwalk.push(branch_oid)?;
+    revwalk.hide(base_oid)?;
+    let commits_squashed = revwalk.filter_map(|r| r.ok()).count();
+
+    if commits_squashed == 0 {
+        anyhow::bail!("branch '{branch}' has no commits ahead of 'main' — nothing to squash");
+    }
+
+    // ── Build the squashed tree ───────────────────────────────────────────────
+    // The tree we want is exactly the branch tip's tree — squashing only
+    // collapses history, it does not change the working-tree state.
+    let branch_commit = repo.find_commit(branch_oid)?;
+    let squashed_tree = branch_commit.tree()?;
+
+    // ── Resolve author ────────────────────────────────────────────────────────
+    let tip_author = branch_commit.author();
+    let author_name  = author_name_override .unwrap_or_else(|| tip_author.name() .unwrap_or("Unknown"));
+    let author_email = author_email_override.unwrap_or_else(|| tip_author.email().unwrap_or(""));
+    let now          = git2::Time::new(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64,
+        0, // UTC offset in minutes
+    );
+    let author    = git2::Signature::new(author_name, author_email, &now)?;
+    let committer = author.clone(); // keep it simple; caller can extend later
+
+    // ── Parent: the merge-base commit ─────────────────────────────────────────
+    // Squashing onto the merge-base means the new commit's parent is the last
+    // commit that is shared with main, which is exactly what `git rebase -i`
+    // does when you squash everything down to one.
+    let base_commit = repo.find_commit(base_oid)?;
+
+    // ── Write the new commit ──────────────────────────────────────────────────
+    let new_oid = repo.commit(
+        None,                // don't update any ref yet — we'll do it atomically below
+        &author,
+        &committer,
+        message,
+        &squashed_tree,
+        &[&base_commit],     // single parent = the merge-base
+    )?;
+
+    // ── Force-update the branch ref ───────────────────────────────────────────
+    // This is the equivalent of `git update-ref -f refs/heads/<branch> <new_oid>`.
+    let reflog_msg = format!(
+        "squash: collapsed {commits_squashed} commit(s) into one on branch '{branch}'"
+    );
+    repo.reference(&branch_ref_name, new_oid, /*force=*/ true, &reflog_msg)?;
+
+    info!(
+        "[squash] {repo_name}/{branch}: squashed {commits_squashed} commit(s) → {new_oid}"
+    );
+
+    Ok(SquashResponse {
+        repo: repo_name.to_string(),
+        branch: branch.to_string(),
+        squashed_commit: new_oid.to_string(),
+        commits_squashed,
+    })
+}
+
+// ── Handler: POST /repo/squash ────────────────────────────────────────────────
+
+#[utoipa::path(
+    post,
+    path = "/repo/squash",
+    tag = "default",
+    request_body(content = SquashRequest, content_type = "application/json"),
+    responses(
+        (status = 200, description = "Squash succeeded",    body = SquashResponse),
+        (status = 400, description = "Validation error",    body = ApiResponse),
+        (status = 404, description = "Repo/branch not found", body = ApiResponse),
+        (status = 500, description = "Internal error",      body = ApiResponse),
+    )
+)]
+pub async fn handle_squash(
+    body: SquashRequest,
+    _state: AppState,
+) -> Result<impl warp::Reply, Infallible> {
+    // ── Validate ──────────────────────────────────────────────────────────────
+    if body.repo.trim().is_empty() {
+        return Ok(bad_request("'repo' must not be empty"));
+    }
+    if body.branch.trim().is_empty() {
+        return Ok(bad_request("'branch' must not be empty"));
+    }
+    if body.branch == "main" {
+        return Ok(bad_request("'branch' must not be 'main'"));
+    }
+    if body.message.trim().is_empty() {
+        return Ok(bad_request("'message' must not be empty"));
+    }
+
+    info!(
+        "POST /repo/squash repo={} branch={} message={:?}",
+        body.repo, body.branch, body.message
+    );
+
+    // ── Dispatch to blocking thread (git2 is not async) ───────────────────────
+    let result = tokio::task::spawn_blocking(move || {
+        let repo = open_repo(&body.repo)?;
+        squash_branch(
+            &repo,
+            &body.repo,
+            &body.branch,
+            &body.message,
+            body.author_name.as_deref(),
+            body.author_email.as_deref(),
+        )
+    })
+    .await;
+
+    match result {
+        Ok(Ok(resp)) => Ok(warp::reply::with_status(
+            warp::reply::json(&resp),
+            StatusCode::OK,
+        )),
+        Ok(Err(e)) => {
+            let msg = e.to_string();
+            error!("[squash] failed: {msg}");
+            // Distinguish "not found" from general errors by message content —
+            // a tighter approach would be a custom error enum, but this keeps
+            // the diff small and consistent with the rest of the file.
+            if msg.contains("not found") {
+                Ok(not_found(msg))
+            } else {
+                Ok(internal_error(msg))
+            }
+        }
+        Err(e) => {
+            error!("[squash] task panicked: {e:#}");
+            Ok(internal_error("internal error during squash"))
+        }
+    }
 }

@@ -19,13 +19,11 @@ use crate::handler_create_db_taskrun::{
     handle_create_db_taskrun, handle_db_taskrun_logs,
 };
 use crate::requests::{
-    AddMemberRequest, ApiResponse, CreateDbTaskRunRequest, DbTaskRunLogsRequest,
-    KubeconfigRequest, MemberTypeDto, RemoveMemberRequest, TaskRunCreateResponse,
-    TaskRunLogsResponse, UpdatePipelineTokenRequest, UpdateTektonKubeconfigRequest,
+    AddMemberRequest, ApiResponse, CreateDbTaskRunRequest, DbTaskRunLogsRequest, KubeconfigRequest, MemberTypeDto, RemoveMemberRequest, SquashRequest, SquashResponse, TaskRunCreateResponse, TaskRunLogsResponse, UpdatePipelineTokenRequest, UpdateTektonKubeconfigRequest
 };
 use crate::state::AppState;
 use crate::repo_handler::{
-    __path_handle_file_content, __path_handle_org_commits, __path_handle_org_diff, BranchCommit, DiffLine, DiffStatus, FileContentRequest, FileContentResponse, FileDiff, OrgBranchCommitsResponse, OrgCommitsRequest, OrgDiffRequest, OrgDiffResponse, RepoBranchCommits, RepoDiff, handle_file_content, handle_org_commits, handle_org_diff
+    __path_handle_file_content, __path_handle_org_commits, __path_handle_org_diff, __path_handle_squash, BranchCommit, DiffLine, DiffStatus, FileContentRequest, FileContentResponse, FileDiff, OrgBranchCommitsResponse, OrgCommitsRequest, OrgDiffRequest, OrgDiffResponse, RepoBranchCommits, RepoDiff, handle_file_content, handle_org_commits, handle_org_diff, handle_squash
 };
 
 // ── OpenAPI document ──────────────────────────────────────────────────────────
@@ -44,6 +42,7 @@ use crate::repo_handler::{
         handle_file_content,
         handle_org_diff,
         handle_org_commits,
+        handle_squash
     ),
     components(schemas(
         AddMemberRequest,
@@ -68,7 +67,9 @@ use crate::repo_handler::{
         OrgBranchCommitsResponse,
         RepoBranchCommits,
         BranchCommit,
-        DiffLine
+        DiffLine,
+        SquashRequest,         
+        SquashResponse, 
     )),
     modifiers(&SecurityAddon),
 )]
@@ -201,6 +202,13 @@ pub fn build(
         .and(with_state(state.clone()))
         .and_then(handle_org_commits);
 
+
+    let squash = warp::path!("repo" / "squash")
+        .and(warp::post())
+        .and(warp::body::json())
+        .and(with_state(state.clone()))
+        .and_then(handle_squash);
+
     // GET /healthz  — no auth, k8s liveness probe
     let health = warp::get()
         .and(warp::path("healthz"))
@@ -233,6 +241,7 @@ pub fn build(
         .or(file_content)
         .or(org_diff)
         .or(org_commits)
+        .or(squash)
         .or(health)
         .or(api_doc)
         .or(swagger_ui)

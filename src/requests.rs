@@ -149,3 +149,23 @@ pub struct TaskRunLogsResponse {
     /// Step termination reason: `Succeeded`, `Failed`, `Running`, or `Unknown`.
     pub status: String,
 }
+
+
+#[derive(Debug, serde::Deserialize, utoipa::ToSchema)]
+pub struct SquashRequest {
+    pub repo: String,
+    pub branch: String,
+    pub message: String,
+    /// Optional: override author name (defaults to the tip commit's author)
+    pub author_name: Option<String>,
+    /// Optional: override author email (defaults to the tip commit's author)
+    pub author_email: Option<String>,
+}
+
+#[derive(Debug, serde::Serialize, utoipa::ToSchema)]
+pub struct SquashResponse {
+    pub repo: String,
+    pub branch: String,
+    pub squashed_commit: String,   // full SHA of the new commit
+    pub commits_squashed: usize,
+}
