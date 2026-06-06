@@ -44,10 +44,21 @@ pub struct OrgDiffRequest {
 }
 
 #[derive(Debug, serde::Serialize, utoipa::ToSchema)]
+pub struct DiffLine {
+    pub origin: char,
+    pub content: String,
+    pub highlighted_light: String,
+    pub highlighted_dark: String,
+    pub old_lineno: Option<u32>,
+    pub new_lineno: Option<u32>,
+}
+
+#[derive(Debug, serde::Serialize, utoipa::ToSchema)]
 pub struct FileDiff {
     pub path: String,
     pub status: DiffStatus,
     pub diff: String,
+    pub lines: Vec<DiffLine>,
 }
 
 #[derive(Debug, serde::Serialize, utoipa::ToSchema)]
@@ -187,8 +198,22 @@ fn find_merge_base(repo: &Repository, main_oid: Oid, branch_oid: Oid) -> anyhow:
     Ok(repo.merge_base(main_oid, branch_oid)?)
 }
 
+fn highlight_line(
+    content: &str,
+    extension: &str,
+    highlighter: &crate::state::HighlighterState,
+) -> (String, String) {
+    highlighter.highlight_line(content, extension)
+}
+
+fn escape_html(s: &str) -> String {
+    s.replace('&', "&amp;")
+     .replace('<', "&lt;")
+     .replace('>', "&gt;")
+}
+
 /// Core diff logic. Returns None if branch does not exist in this repo.
-fn diff_repo(repo: &Repository, repo_name: &str, branch: &str) -> Option<RepoDiff> {
+fn diff_repo(repo: &Repository, repo_name: &str, branch: &str, highlighter: &crate::state::HighlighterState) -> Option<RepoDiff> {
     let main_oid = repo
         .find_branch("main", git2::BranchType::Local)
         .ok()?
@@ -230,6 +255,7 @@ fn diff_repo(repo: &Repository, repo_name: &str, branch: &str) -> Option<RepoDif
     let mut current_path = String::new();
     let mut current_status = DiffStatus::Unknown;
     let mut current_diff = String::new();
+    let mut current_lines: Vec<DiffLine> = Vec::new();
 
     let _ = diff.print(git2::DiffFormat::Patch, |delta, _hunk, line| {
         let path = delta
@@ -239,12 +265,12 @@ fn diff_repo(repo: &Repository, repo_name: &str, branch: &str) -> Option<RepoDif
             .map(|p| p.to_string_lossy().to_string())
             .unwrap_or_default();
 
-        // Flush previous file when path changes
         if !current_path.is_empty() && path != current_path {
             files.push(FileDiff {
                 path: current_path.clone(),
                 status: std::mem::replace(&mut current_status, DiffStatus::Unknown),
                 diff: std::mem::take(&mut current_diff),
+                lines: std::mem::take(&mut current_lines),
             });
         }
 
@@ -260,23 +286,47 @@ fn diff_repo(repo: &Repository, repo_name: &str, branch: &str) -> Option<RepoDif
             };
         }
 
+        let origin = line.origin();
+
         if let Ok(content) = std::str::from_utf8(line.content()) {
-            match line.origin() {
-                '+' | '-' | ' ' => current_diff.push(line.origin()),
-                _ => {}
+            match origin {
+                '+' | '-' | ' ' => {
+                    current_diff.push(origin);
+                    current_diff.push_str(content);
+
+                    let ext = std::path::Path::new(&current_path)
+                        .extension()
+                        .and_then(|e| e.to_str())
+                        .unwrap_or("txt");
+
+                    let trimmed = content.trim_end_matches('\n');
+                    let (highlighted_light, highlighted_dark) =
+                        highlighter.highlight_line(trimmed, ext);
+
+                    current_lines.push(DiffLine {
+                        origin,
+                        content: trimmed.to_string(),
+                        highlighted_light,
+                        highlighted_dark,
+                        old_lineno: line.old_lineno(),
+                        new_lineno: line.new_lineno(),
+                    });
+                }
+                _ => {
+                    current_diff.push_str(content);
+                }
             }
-            current_diff.push_str(content);
         }
 
         true
     });
 
-    // Flush the last file
     if !current_path.is_empty() {
         files.push(FileDiff {
             path: current_path,
             status: current_status,
             diff: current_diff,
+            lines: current_lines,
         });
     }
 
@@ -537,7 +587,7 @@ pub async fn handle_file_content(
 )]
 pub async fn handle_org_diff(
     body: OrgDiffRequest,
-    _state: AppState,
+    state: AppState,
 ) -> Result<impl warp::Reply, Infallible> {
     if let Err(r) = validate_org_branch(&body.org_id, &body.branch) {
         return Ok(r);
@@ -561,12 +611,14 @@ pub async fn handle_org_diff(
     let mut handles = Vec::with_capacity(repo_names.len());
     for repo_name in repo_names {
         let branch = body.branch.clone();
+        // Clone the Arc so the blocking task owns it
+        let state = state.clone();
         handles.push(tokio::task::spawn_blocking(move || {
             let repo = match open_repo(&repo_name) {
                 Ok(r)  => r,
                 Err(e) => { warn!("[org/diff] open_repo({repo_name}) failed: {e:#}"); return (repo_name, None); }
             };
-            let result = diff_repo(&repo, &repo_name, &branch);
+            let result = diff_repo(&repo, &repo_name, &branch, &state.0.highlighter);
             (repo_name, result)
         }));
     }
