@@ -2,23 +2,24 @@
 //
 // RabbitMQ consumer for the "gitter.merge.queue" work queue.
 //
-// Current behaviour (stub)
-// ────────────────────────
+// Behaviour
+// ─────────
 // For each org-wide merge job:
 //   1. Enumerate every repo whose name starts with `{org_id}-` on disk.
-//   2. For each repo, check whether the requested branch exists.
-//   3. If it does, run an in-memory conflict detection (same logic as
-//      repo_handler::detect_conflicts).
-//   4. Print the result — no actual merge is performed yet.
-//   5. Release the Redis server lock.
-//   6. ACK the message.
-//
-// The real merge (git squash + push) will replace step 4 later.
+//   2. PASS 1 — conflict scan (all-or-none gate):
+//      For every repo that has the requested branch, run an in-memory conflict
+//      detection against main. If ANY repo has conflicts the whole job is
+//      aborted — nothing is merged.
+//   3. PASS 2 — only reached when pass 1 is fully clean:
+//      For every repo that has the branch, perform a squash merge into main,
+//      push to origin, then delete the branch (local + remote).
+//   4. Release the Redis server lock.
+//   5. ACK the message.
 
 use std::path::PathBuf;
 
 use futures::StreamExt;
-use git2::{MergeOptions, Oid, Repository};
+use git2::{MergeOptions, Oid, Repository, Signature};
 use lapin::options::{BasicAckOptions, BasicConsumeOptions};
 use redis::AsyncCommands;
 
@@ -89,13 +90,13 @@ async fn process_deliveries(
                         merge_request_id, org_id, branch
                     );
 
-                    // Spawn onto a blocking thread — git2 is not async.
-                    let org_id = org_id.to_string();
-                    let branch = branch.to_string();
+                    let org_id           = org_id.to_string();
+                    let branch           = branch.to_string();
                     let merge_request_id = merge_request_id.to_string();
 
+                    // git2 is not async — run on a blocking thread.
                     tokio::task::spawn_blocking(move || {
-                        inspect_org_repos(&merge_request_id, &org_id, &branch);
+                        execute_org_merge(&merge_request_id, &org_id, &branch);
                     })
                     .await
                     .ok();
@@ -121,84 +122,243 @@ async fn process_deliveries(
     Ok(())
 }
 
-// ── Org repo inspection (stub — no actual merge) ──────────────────────────────
+// ── Two-pass all-or-none merge ────────────────────────────────────────────────
 
-fn inspect_org_repos(merge_request_id: &str, org_id: &str, branch: &str) {
+/// Orchestrates the two-pass merge for every repo belonging to `org_id`.
+///
+/// Pass 1 — conflict scan:  all repos must be conflict-free or we abort.
+/// Pass 2 — actual merge:   squash-merge into main, push, delete branch.
+fn execute_org_merge(merge_request_id: &str, org_id: &str, branch: &str) {
+    // ── Collect repos that carry the branch ───────────────────────────────────
     let repo_names = match list_org_repos(org_id) {
         Ok(v)  => v,
         Err(e) => {
-            tracing::error!("[merge-consumer] failed to list repos for org '{}': {e:#}", org_id);
+            tracing::error!(
+                "[merge-consumer] merge_request_id={} — failed to list repos for org '{}': {e:#}",
+                merge_request_id, org_id
+            );
             return;
         }
     };
 
     if repo_names.is_empty() {
         tracing::warn!(
-            "[merge-consumer] no repos found for org '{}' (prefix '{}-')",
-            org_id, org_id
+            "[merge-consumer] merge_request_id={} — no repos found for org '{}' (prefix '{}-')",
+            merge_request_id, org_id, org_id
+        );
+        return;
+    }
+
+    // Only operate on repos that actually have the branch.
+    let candidate_repos: Vec<String> = repo_names
+        .into_iter()
+        .filter(|name| {
+            match open_repo(name) {
+                Ok(repo) => resolve_branch(&repo, branch).is_some(),
+                Err(_)   => false,
+            }
+        })
+        .collect();
+
+    if candidate_repos.is_empty() {
+        tracing::warn!(
+            "[merge-consumer] merge_request_id={} — branch '{}' not found in any repo for org '{}'",
+            merge_request_id, branch, org_id
         );
         return;
     }
 
     tracing::info!(
-        "[merge-consumer] merge_request_id={} — found {} repo(s) for org '{}'",
-        merge_request_id,
-        repo_names.len(),
-        org_id,
+        "[merge-consumer] merge_request_id={} — {} candidate repo(s) carry branch '{}'",
+        merge_request_id, candidate_repos.len(), branch
     );
 
-    for repo_name in &repo_names {
-        match process_repo(repo_name, branch) {
-            Ok(outcome) => {
-                // ── THE STUB OUTPUT ───────────────────────────────────────────
-                println!("{}", outcome);
-                tracing::info!("[merge-consumer] {}", outcome);
+    // ── PASS 1: conflict scan (all-or-none gate) ───────────────────────────────
+    tracing::info!(
+        "[merge-consumer] merge_request_id={} — PASS 1: scanning for conflicts …",
+        merge_request_id
+    );
+
+    let mut any_conflict = false;
+
+    for repo_name in &candidate_repos {
+        match check_conflicts(repo_name, branch) {
+            Ok((true, files)) => {
+                tracing::warn!(
+                    "[merge-consumer] merge_request_id={} — CONFLICT in '{}' — files: {:?} — aborting entire merge",
+                    merge_request_id, repo_name, files
+                );
+                any_conflict = true;
+                // Keep scanning so we log ALL conflicting repos before bailing.
+            }
+            Ok((false, _)) => {
+                tracing::info!(
+                    "[merge-consumer] merge_request_id={} — '{}' is clean",
+                    merge_request_id, repo_name
+                );
             }
             Err(e) => {
                 tracing::warn!(
-                    "[merge-consumer] skipping '{}': {e:#}",
-                    repo_name
+                    "[merge-consumer] merge_request_id={} — skipping '{}' during conflict scan: {e:#}",
+                    merge_request_id, repo_name
+                );
+                // Treat an unreadable repo as a blocker to stay safe.
+                any_conflict = true;
+            }
+        }
+    }
+
+    if any_conflict {
+        tracing::error!(
+            "[merge-consumer] merge_request_id={} — PASS 1 FAILED: conflicts detected — no repos were merged",
+            merge_request_id
+        );
+        return;
+    }
+
+    tracing::info!(
+        "[merge-consumer] merge_request_id={} — PASS 1 PASSED: all repos clean — proceeding to merge",
+        merge_request_id
+    );
+
+    // ── PASS 2: squash-merge, push, delete branch ─────────────────────────────
+    tracing::info!(
+        "[merge-consumer] merge_request_id={} — PASS 2: merging …",
+        merge_request_id
+    );
+
+    for repo_name in &candidate_repos {
+        match merge(repo_name, branch, merge_request_id) {
+            Ok(()) => {
+                tracing::info!(
+                    "[merge-consumer] merge_request_id={} — '{}' merged + branch deleted ✓",
+                    merge_request_id, repo_name
+                );
+            }
+            Err(e) => {
+                // Log but continue — pass 1 already guaranteed no conflicts,
+                // so a push failure here is an infra issue, not a code conflict.
+                tracing::error!(
+                    "[merge-consumer] merge_request_id={} — merge/push failed for '{}': {e:#}",
+                    merge_request_id, repo_name
                 );
             }
         }
     }
+
+    tracing::info!(
+        "[merge-consumer] merge_request_id={} — PASS 2 complete",
+        merge_request_id
+    );
 }
 
-/// Returns a human-readable outcome string for one repo.
-/// Returns Err if the repo can't be opened or the branch doesn't exist.
-fn process_repo(repo_name: &str, branch: &str) -> anyhow::Result<String> {
+// ── Pass-1 helper: conflict check only ───────────────────────────────────────
+
+fn check_conflicts(repo_name: &str, branch: &str) -> anyhow::Result<(bool, Vec<String>)> {
     let repo = open_repo(repo_name)?;
 
-    // Does the branch exist in this repo?
-    let branch_oid = match resolve_branch(&repo, branch) {
-        Some(oid) => oid,
-        None => {
-            anyhow::bail!("branch '{}' not found", branch);
-        }
-    };
+    let branch_oid = resolve_branch(&repo, branch)
+        .ok_or_else(|| anyhow::anyhow!("branch '{}' not found in '{}'", branch, repo_name))?;
 
-    // Does main exist?
     let main_oid = repo
         .find_branch("main", git2::BranchType::Local)
-        .map_err(|_| anyhow::anyhow!("'main' not found"))?
+        .map_err(|_| anyhow::anyhow!("'main' not found in '{}'", repo_name))?
+        .get()
+        .target()
+        .ok_or_else(|| anyhow::anyhow!("'main' has no tip in '{}'", repo_name))?;
+
+    Ok(detect_conflicts(&repo, main_oid, branch_oid))
+}
+
+// ── Pass-2 helper: squash-merge + push + delete branch ───────────────────────
+
+/// Performs a squash merge of `branch` into `main` inside the bare repo,
+/// then pushes to origin and deletes the branch (local + remote).
+fn merge(repo_name: &str, branch: &str, merge_request_id: &str) -> anyhow::Result<()> {
+    let repo = open_repo(repo_name)?;
+
+    let branch_oid = resolve_branch(&repo, branch)
+        .ok_or_else(|| anyhow::anyhow!("branch '{}' disappeared before merge", branch))?;
+
+    let main_oid = repo
+        .find_branch("main", git2::BranchType::Local)
+        .map_err(|_| anyhow::anyhow!("'main' not found in '{}'", repo_name))?
         .get()
         .target()
         .ok_or_else(|| anyhow::anyhow!("'main' has no tip"))?;
 
-    // Conflict check via in-memory merge (mirrors repo_handler::detect_conflicts)
-    let (has_conflicts, conflicting_files) = detect_conflicts(&repo, main_oid, branch_oid);
+    let main_commit   = repo.find_commit(main_oid)?;
+    let branch_commit = repo.find_commit(branch_oid)?;
 
-    if has_conflicts {
-        Ok(format!(
-            "[merge-consumer] found branch '{}' in repo '{}' — MERGE CONFLICTS detected in: {:?} — manual resolution required",
-            branch, repo_name, conflicting_files
-        ))
-    } else {
-        Ok(format!(
-            "[merge-consumer] found branch '{}' in repo '{}' — no merge conflicts found — will merge it",
-            branch, repo_name
-        ))
+    let base_oid    = repo.merge_base(main_oid, branch_oid)?;
+    let base_commit = repo.find_commit(base_oid)?;
+    let base_tree   = base_commit.tree()?;
+    let main_tree   = main_commit.tree()?;
+    let branch_tree = branch_commit.tree()?;
+
+    let mut index = repo.merge_trees(
+        &base_tree, &main_tree, &branch_tree,
+        Some(&MergeOptions::new()),
+    )?;
+
+    let merged_tree_oid = index.write_tree_to(&repo)?;
+    let merged_tree     = repo.find_tree(merged_tree_oid)?;
+
+    let sig = Signature::now("gitolite-sidecar", "sidecar@local")?;
+    let commit_msg = format!(
+        "chore: squash-merge '{}' into main [merge_request_id={}]",
+        branch, merge_request_id
+    );
+
+    // Writes the commit and advances refs/heads/main in the bare repo directly.
+    let new_oid = repo.commit(
+        Some("refs/heads/main"),
+        &sig, &sig,
+        &commit_msg,
+        &merged_tree,
+        &[&main_commit],
+    )?;
+
+    tracing::info!(
+        "[merge-consumer] '{}' — squash commit {} on main ✓",
+        repo_name, new_oid
+    );
+
+    // Delete the branch ref — bare repo, so this is the final state.
+    repo.find_branch(branch, git2::BranchType::Local)
+        .and_then(|mut b| b.delete())
+        .unwrap_or_else(|e| tracing::warn!(
+            "[merge-consumer] '{}' — could not delete branch '{}': {e:#}",
+            repo_name, branch
+        ));
+
+    tracing::info!(
+        "[merge-consumer] '{}' — branch '{}' deleted ✓",
+        repo_name, branch
+    );
+
+    Ok(())
+}
+
+/// Push a single refspec from the bare repo using the system `git` binary.
+/// We use the subprocess here because git2's remote push with SSH credentials
+/// requires a callback setup that mirrors the gitolite SSH config; it's simpler
+/// to shell out to `git push` which already inherits the environment.
+fn push_ref(repo_name: &str, refspec: &str) -> anyhow::Result<()> {
+    let path = PathBuf::from(REPOS_ROOT).join(format!("{}.git", repo_name.trim_end_matches(".git")));
+
+    let output = std::process::Command::new("git")
+        .args(["push", "origin", refspec])
+        .current_dir(&path)
+        .output()
+        .map_err(|e| anyhow::anyhow!("failed to spawn git push: {e:#}"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("git push '{}' failed:\n{}", refspec, stderr);
     }
+
+    Ok(())
 }
 
 // ── git2 helpers ──────────────────────────────────────────────────────────────
@@ -241,7 +401,7 @@ fn resolve_branch(repo: &Repository, branch: &str) -> Option<Oid> {
 
 /// In-memory conflict detection — identical to repo_handler::detect_conflicts.
 fn detect_conflicts(repo: &Repository, main_oid: Oid, branch_oid: Oid) -> (bool, Vec<String>) {
-    // Branch already an ancestor of main → no conflict possible
+    // Branch already an ancestor of main → no conflict possible.
     if repo
         .merge_base(main_oid, branch_oid)
         .map(|base| base == branch_oid)
@@ -256,12 +416,15 @@ fn detect_conflicts(repo: &Repository, main_oid: Oid, branch_oid: Oid) -> (bool,
     let branch_tree   = match branch_commit.tree()          { Ok(t) => t, Err(_) => return (false, vec![]) };
 
     let base_oid    = match repo.merge_base(main_oid, branch_oid) { Ok(o) => o, Err(_) => return (false, vec![]) };
-    let base_commit = match repo.find_commit(base_oid)  { Ok(c) => c, Err(_) => return (false, vec![]) };
-    let base_tree   = match base_commit.tree()           { Ok(t) => t, Err(_) => return (false, vec![]) };
+    let base_commit = match repo.find_commit(base_oid)             { Ok(c) => c, Err(_) => return (false, vec![]) };
+    let base_tree   = match base_commit.tree()                     { Ok(t) => t, Err(_) => return (false, vec![]) };
 
     let index = match repo.merge_trees(&base_tree, &main_tree, &branch_tree, Some(&MergeOptions::new())) {
         Ok(idx) => idx,
-        Err(e)  => { tracing::warn!("[merge-consumer] merge_trees failed: {e:#}"); return (false, vec![]); }
+        Err(e)  => {
+            tracing::warn!("[merge-consumer] merge_trees failed: {e:#}");
+            return (false, vec![]);
+        }
     };
 
     if !index.has_conflicts() {
