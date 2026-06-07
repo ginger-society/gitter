@@ -114,7 +114,7 @@ async fn main() -> Result<()> {
     scheduler.start().await?;
     info!("[backup] ✓ cron registered (fires at :00 of every hour)");
 
-    // ── Startup backup ────────────────────────────────────────────────────────
+    // // ── Startup backup ────────────────────────────────────────────────────────
     // info!("[backup] running initial backup on startup …");
     // match backup::run_backup(&state).await {
     //     Ok(_)  => info!("[backup] ✓ startup backup complete"),
@@ -138,7 +138,7 @@ async fn main() -> Result<()> {
     info!("  Endpoints");
     info!("    POST http://0.0.0.0:{}/permissions", config.port);
     info!("    POST http://0.0.0.0:{}/kubeconfig", config.port);
-    info!("    POST http://0.0.0.0:{}/repo/merge-queue", config.port);
+    info!("    POST http://0.0.0.0:{}/org/merge-queue", config.port);
     info!("    GET  http://0.0.0.0:{}/healthz", config.port);
     info!("    GET  http://0.0.0.0:{}/api-doc.json", config.port);
     info!("    GET  http://0.0.0.0:{}/swagger-ui/", config.port);

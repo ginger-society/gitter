@@ -1,27 +1,31 @@
 // src/merge_queue_handler.rs
 //
-// POST /repo/merge-queue
+// POST /org/merge-queue
 //
-// Accepts a merge request, acquires a Redis-backed server lock (TTL = 60 s),
-// stores the merge-request ID for reference, then publishes the job to the
-// durable RabbitMQ work queue.
+// Accepts an org-wide merge request. The handler:
+//   1. Validates inputs.
+//   2. Generates a fresh UUID as the merge_request_id.
+//   3. Acquires a Redis server lock (TTL = 60 s) so only one merge runs at a
+//      time across the entire git server.
+//   4. Stores the merge_request_id so other callers can see who holds the lock.
+//   5. Publishes one job to the durable RabbitMQ work queue.
+//   6. Returns the generated merge_request_id immediately — the actual work
+//      happens asynchronously in the consumer.
 //
 // Redis keys
 // ──────────
-//   git:server:lock                 → "1"  (SET NX EX 60)
-//                                     Present while a merge is in flight.
-//   git:merge:current               → <merge_request_id>
-//                                     Identifies which request holds the lock.
+//   git:server:lock      → "1"                (SET NX EX 60)
+//   git:merge:current    → <merge_request_id> (SET EX 60)
 //
-// Conflict response
-// ─────────────────
-//   HTTP 409 — body contains the ID of the request currently holding the lock.
+// HTTP 409 is returned when the lock is already held, with the ID of the
+// blocking request in the response body.
 
 use std::convert::Infallible;
 
 use redis::AsyncCommands;
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
+use uuid::Uuid;
 use warp::http::StatusCode;
 
 use crate::rabbit::{publish_merge_request, RabbitPoolRef};
@@ -30,31 +34,27 @@ use crate::state::AppState;
 
 // ── Redis key constants ───────────────────────────────────────────────────────
 
-pub const SERVER_LOCK_KEY:    &str = "git:server:lock";
-pub const CURRENT_MERGE_KEY:  &str = "git:merge:current";
-pub const SERVER_LOCK_TTL:     u64 = 60; // seconds
+pub const SERVER_LOCK_KEY:   &str = "git:server:lock";
+pub const CURRENT_MERGE_KEY: &str = "git:merge:current";
+pub const SERVER_LOCK_TTL:    u64 = 60; // seconds
 
 // ── Request / Response ────────────────────────────────────────────────────────
 
-/// Body for POST /repo/merge-queue
+/// Body for POST /org/merge-queue
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct MergeQueueRequest {
-    /// Unique identifier for this merge request (e.g. a UUID or PR number).
-    pub merge_request_id: String,
-    /// Repository name (same format as the `repo` field in other endpoints).
-    pub repo: String,
-    /// The feature branch to merge into `main`.
+    /// Organisation prefix — repos must be named `{org_id}-*`
+    pub org_id: String,
+    /// Feature branch to merge into `main` in every matching repo.
     pub branch: String,
-    /// Optional human-readable description / commit message.
-    #[serde(default)]
-    pub message: Option<String>,
 }
 
 /// Successful enqueue response
 #[derive(Debug, Serialize, ToSchema)]
 pub struct MergeQueueResponse {
+    /// Server-generated UUID that uniquely identifies this merge request.
     pub merge_request_id: String,
-    pub repo: String,
+    pub org_id: String,
     pub branch: String,
     pub status: &'static str,
     /// How long (seconds) the server lock will be held.
@@ -73,14 +73,14 @@ pub struct MergeQueueConflict {
 
 #[utoipa::path(
     post,
-    path = "/repo/merge-queue",
+    path = "/org/merge-queue",
     tag = "default",
     request_body(content = MergeQueueRequest, content_type = "application/json"),
     responses(
-        (status = 200, description = "Request enqueued",           body = MergeQueueResponse),
-        (status = 400, description = "Validation error",           body = ApiResponse),
-        (status = 409, description = "Server locked by another merge request", body = MergeQueueConflict),
-        (status = 500, description = "Internal error",             body = ApiResponse),
+        (status = 200, description = "Request enqueued",                          body = MergeQueueResponse),
+        (status = 400, description = "Validation error",                          body = ApiResponse),
+        (status = 409, description = "Server locked by another merge request",    body = MergeQueueConflict),
+        (status = 500, description = "Internal error",                            body = ApiResponse),
     )
 )]
 pub async fn handle_merge_queue(
@@ -89,11 +89,11 @@ pub async fn handle_merge_queue(
     rabbit: RabbitPoolRef,
 ) -> Result<impl warp::Reply, Infallible> {
     // ── Validate ──────────────────────────────────────────────────────────────
-    if body.merge_request_id.trim().is_empty() {
-        return Ok(bad_request("'merge_request_id' must not be empty"));
+    if body.org_id.trim().is_empty() {
+        return Ok(bad_request("'org_id' must not be empty"));
     }
-    if body.repo.trim().is_empty() {
-        return Ok(bad_request("'repo' must not be empty"));
+    if body.org_id.contains('/') || body.org_id.contains("..") {
+        return Ok(bad_request("'org_id' contains invalid characters"));
     }
     if body.branch.trim().is_empty() {
         return Ok(bad_request("'branch' must not be empty"));
@@ -102,18 +102,19 @@ pub async fn handle_merge_queue(
         return Ok(bad_request("'branch' must not be 'main'"));
     }
 
+    // ── Generate a fresh merge_request_id ─────────────────────────────────────
+    let merge_request_id = Uuid::new_v4().to_string();
+
     tracing::info!(
-        "POST /repo/merge-queue merge_request_id={} repo={} branch={}",
-        body.merge_request_id,
-        body.repo,
+        "POST /org/merge-queue merge_request_id={} org_id={} branch={}",
+        merge_request_id,
+        body.org_id,
         body.branch,
     );
 
     let mut redis = state.0.redis.clone();
 
     // ── Acquire server lock (SET NX EX) ───────────────────────────────────────
-    // SET git:server:lock "1" NX EX 60
-    // Returns true only if the key did NOT exist (we got the lock).
     let acquired: bool = redis::cmd("SET")
         .arg(SERVER_LOCK_KEY)
         .arg("1")
@@ -125,16 +126,16 @@ pub async fn handle_merge_queue(
         .unwrap_or(false);
 
     if !acquired {
-        // Read who currently holds the lock for a helpful 409 body.
         let locked_by: String = redis
             .get(CURRENT_MERGE_KEY)
             .await
             .unwrap_or_else(|_| "unknown".to_string());
 
         tracing::warn!(
-            "[merge-queue] server locked by '{}' — rejecting '{}'",
+            "[merge-queue] server locked by '{}' — rejecting new request for org={} branch={}",
             locked_by,
-            body.merge_request_id
+            body.org_id,
+            body.branch,
         );
 
         return Ok(warp::reply::with_status(
@@ -147,44 +148,42 @@ pub async fn handle_merge_queue(
         .into_response());
     }
 
-    // ── Store the merge_request_id that holds the lock ────────────────────────
-    // Use the same TTL so this key doesn't outlive the lock.
+    // ── Record who holds the lock ─────────────────────────────────────────────
     let _: Result<(), _> = redis
         .set_ex(
             CURRENT_MERGE_KEY,
-            &body.merge_request_id,
+            &merge_request_id,
             SERVER_LOCK_TTL.try_into().unwrap(),
         )
         .await;
 
     tracing::info!(
         "[merge-queue] lock acquired by '{}' (TTL={}s)",
-        body.merge_request_id,
+        merge_request_id,
         SERVER_LOCK_TTL,
     );
 
-    // ── Enqueue the job ───────────────────────────────────────────────────────
+    // ── Publish job to RabbitMQ ───────────────────────────────────────────────
     let payload = serde_json::json!({
-        "merge_request_id": body.merge_request_id,
-        "repo":             body.repo,
+        "merge_request_id": merge_request_id,
+        "org_id":           body.org_id,
         "branch":           body.branch,
-        "message":          body.message,
     });
 
     publish_merge_request(&rabbit, &payload.to_string()).await;
 
     tracing::info!(
         "[merge-queue] job published to RabbitMQ merge_request_id={}",
-        body.merge_request_id,
+        merge_request_id,
     );
 
     Ok(warp::reply::with_status(
         warp::reply::json(&MergeQueueResponse {
-            merge_request_id: body.merge_request_id,
-            repo:             body.repo,
-            branch:           body.branch,
-            status:           "queued",
-            lock_ttl_secs:    SERVER_LOCK_TTL,
+            merge_request_id,
+            org_id:        body.org_id,
+            branch:        body.branch,
+            status:        "queued",
+            lock_ttl_secs: SERVER_LOCK_TTL,
         }),
         StatusCode::OK,
     )
@@ -193,8 +192,6 @@ pub async fn handle_merge_queue(
 
 // ── Reply helpers ─────────────────────────────────────────────────────────────
 
-// We need a unified return type so both branches compile.
-// warp::reply::Response is Box<dyn warp::Reply>.
 trait IntoResponse {
     fn into_response(self) -> warp::reply::Response;
 }
@@ -206,8 +203,6 @@ impl<R: warp::Reply> IntoResponse for warp::reply::WithStatus<R> {
         )
     }
 }
-
-type JsonReply = warp::reply::WithStatus<warp::reply::Json>;
 
 fn bad_request(msg: impl Into<String>) -> warp::reply::Response {
     warp::reply::with_status(

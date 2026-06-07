@@ -4,17 +4,21 @@
 //
 // Current behaviour (stub)
 // ────────────────────────
-// 1. Connect to RabbitMQ using the URI stored in the RabbitPool (sourced from
-//    Config.ampq_uri — no env look-up at runtime).
-// 2. For each delivery, print the raw message payload.
-// 3. Release the Redis server lock (delete `git:server:lock` and
-//    `git:merge:current`).
-// 4. ACK the message so RabbitMQ removes it from the queue.
-// 5. Reconnect with a 5-second back-off on any channel error.
+// For each org-wide merge job:
+//   1. Enumerate every repo whose name starts with `{org_id}-` on disk.
+//   2. For each repo, check whether the requested branch exists.
+//   3. If it does, run an in-memory conflict detection (same logic as
+//      repo_handler::detect_conflicts).
+//   4. Print the result — no actual merge is performed yet.
+//   5. Release the Redis server lock.
+//   6. ACK the message.
 //
-// The actual merge logic (git squash + push) will replace step 3 later.
+// The real merge (git squash + push) will replace step 4 later.
+
+use std::path::PathBuf;
 
 use futures::StreamExt;
+use git2::{MergeOptions, Oid, Repository};
 use lapin::options::{BasicAckOptions, BasicConsumeOptions};
 use redis::AsyncCommands;
 
@@ -22,9 +26,10 @@ use crate::merge_queue_handler::{CURRENT_MERGE_KEY, SERVER_LOCK_KEY};
 use crate::rabbit::{connect_channel, RabbitPoolRef, MERGE_QUEUE};
 use crate::state::AppState;
 
+const REPOS_ROOT: &str = "/home/git/repositories";
+
 // ── Entry point ───────────────────────────────────────────────────────────────
 
-/// Spawn the consumer loop. Call once from `main` after AppState is ready.
 pub async fn start_merge_consumer(state: AppState, rabbit: RabbitPoolRef) {
     tokio::spawn(async move {
         run_consumer_loop(state, rabbit).await;
@@ -34,8 +39,6 @@ pub async fn start_merge_consumer(state: AppState, rabbit: RabbitPoolRef) {
 // ── Consumer loop ─────────────────────────────────────────────────────────────
 
 async fn run_consumer_loop(state: AppState, rabbit: RabbitPoolRef) {
-    // The consumer opens its own AMQP connection so it doesn't share the
-    // publish channel's Mutex, but uses the same URI from the pool.
     let addr = rabbit.ampq_uri.clone();
 
     loop {
@@ -65,7 +68,6 @@ async fn process_deliveries(
         .basic_consume(
             MERGE_QUEUE,
             &format!("gitter_merge_consumer_{}", uuid::Uuid::new_v4()),
-            // manual ACK — we confirm only after releasing the lock
             BasicConsumeOptions::default(),
             Default::default(),
         )
@@ -75,29 +77,39 @@ async fn process_deliveries(
         match delivery {
             Ok(delivery) => {
                 let raw = String::from_utf8_lossy(&delivery.data).to_string();
+                tracing::info!("[merge-consumer] received job: {}", raw);
 
-                // ── Print the payload (stub — real merge logic goes here) ──────
-                tracing::info!("[merge-consumer] ── received merge job ──");
-                tracing::info!("[merge-consumer] payload: {}", raw);
-                println!("[merge-consumer] RAW payload:\n{raw}\n");
-
-                // ── Structured logging ────────────────────────────────────────
                 if let Ok(val) = serde_json::from_str::<serde_json::Value>(&raw) {
+                    let merge_request_id = val["merge_request_id"].as_str().unwrap_or("?");
+                    let org_id           = val["org_id"].as_str().unwrap_or("");
+                    let branch           = val["branch"].as_str().unwrap_or("");
+
                     tracing::info!(
-                        "[merge-consumer] merge_request_id={} repo={} branch={}",
-                        val["merge_request_id"].as_str().unwrap_or("?"),
-                        val["repo"].as_str().unwrap_or("?"),
-                        val["branch"].as_str().unwrap_or("?"),
+                        "[merge-consumer] processing merge_request_id={} org_id={} branch={}",
+                        merge_request_id, org_id, branch
                     );
+
+                    // Spawn onto a blocking thread — git2 is not async.
+                    let org_id = org_id.to_string();
+                    let branch = branch.to_string();
+                    let merge_request_id = merge_request_id.to_string();
+
+                    tokio::task::spawn_blocking(move || {
+                        inspect_org_repos(&merge_request_id, &org_id, &branch);
+                    })
+                    .await
+                    .ok();
+                } else {
+                    tracing::warn!("[merge-consumer] failed to parse job payload: {}", raw);
                 }
 
                 // ── Release the Redis server lock ─────────────────────────────
                 release_lock(&state.0.redis).await;
 
-                // ── ACK the message ───────────────────────────────────────────
+                // ── ACK ───────────────────────────────────────────────────────
                 delivery.ack(BasicAckOptions::default()).await?;
 
-                tracing::info!("[merge-consumer] job processed and lock released");
+                tracing::info!("[merge-consumer] job done — lock released");
             }
             Err(e) => {
                 tracing::error!("[merge-consumer] delivery error: {e:#}");
@@ -109,12 +121,173 @@ async fn process_deliveries(
     Ok(())
 }
 
+// ── Org repo inspection (stub — no actual merge) ──────────────────────────────
+
+fn inspect_org_repos(merge_request_id: &str, org_id: &str, branch: &str) {
+    let repo_names = match list_org_repos(org_id) {
+        Ok(v)  => v,
+        Err(e) => {
+            tracing::error!("[merge-consumer] failed to list repos for org '{}': {e:#}", org_id);
+            return;
+        }
+    };
+
+    if repo_names.is_empty() {
+        tracing::warn!(
+            "[merge-consumer] no repos found for org '{}' (prefix '{}-')",
+            org_id, org_id
+        );
+        return;
+    }
+
+    tracing::info!(
+        "[merge-consumer] merge_request_id={} — found {} repo(s) for org '{}'",
+        merge_request_id,
+        repo_names.len(),
+        org_id,
+    );
+
+    for repo_name in &repo_names {
+        match process_repo(repo_name, branch) {
+            Ok(outcome) => {
+                // ── THE STUB OUTPUT ───────────────────────────────────────────
+                println!("{}", outcome);
+                tracing::info!("[merge-consumer] {}", outcome);
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "[merge-consumer] skipping '{}': {e:#}",
+                    repo_name
+                );
+            }
+        }
+    }
+}
+
+/// Returns a human-readable outcome string for one repo.
+/// Returns Err if the repo can't be opened or the branch doesn't exist.
+fn process_repo(repo_name: &str, branch: &str) -> anyhow::Result<String> {
+    let repo = open_repo(repo_name)?;
+
+    // Does the branch exist in this repo?
+    let branch_oid = match resolve_branch(&repo, branch) {
+        Some(oid) => oid,
+        None => {
+            anyhow::bail!("branch '{}' not found", branch);
+        }
+    };
+
+    // Does main exist?
+    let main_oid = repo
+        .find_branch("main", git2::BranchType::Local)
+        .map_err(|_| anyhow::anyhow!("'main' not found"))?
+        .get()
+        .target()
+        .ok_or_else(|| anyhow::anyhow!("'main' has no tip"))?;
+
+    // Conflict check via in-memory merge (mirrors repo_handler::detect_conflicts)
+    let (has_conflicts, conflicting_files) = detect_conflicts(&repo, main_oid, branch_oid);
+
+    if has_conflicts {
+        Ok(format!(
+            "[merge-consumer] found branch '{}' in repo '{}' — MERGE CONFLICTS detected in: {:?} — manual resolution required",
+            branch, repo_name, conflicting_files
+        ))
+    } else {
+        Ok(format!(
+            "[merge-consumer] found branch '{}' in repo '{}' — no merge conflicts found — will merge it",
+            branch, repo_name
+        ))
+    }
+}
+
+// ── git2 helpers ──────────────────────────────────────────────────────────────
+
+fn open_repo(repo_name: &str) -> anyhow::Result<Repository> {
+    let name = repo_name.trim_end_matches(".git");
+    if name.is_empty() || name.contains('/') || name.contains("..") {
+        anyhow::bail!("invalid repo name: {:?}", repo_name);
+    }
+    let path = PathBuf::from(REPOS_ROOT).join(format!("{name}.git"));
+    if !path.exists() {
+        anyhow::bail!("repository '{}' not found at {}", name, path.display());
+    }
+    Ok(Repository::open_bare(&path)?)
+}
+
+fn list_org_repos(org_id: &str) -> anyhow::Result<Vec<String>> {
+    let prefix = format!("{org_id}-");
+    let mut names = Vec::new();
+
+    for entry in std::fs::read_dir(REPOS_ROOT)? {
+        let entry = entry?;
+        let fname = entry.file_name();
+        let fname = fname.to_string_lossy();
+
+        if fname.starts_with(&prefix) && fname.ends_with(".git") {
+            names.push(fname.trim_end_matches(".git").to_string());
+        }
+    }
+
+    names.sort();
+    Ok(names)
+}
+
+fn resolve_branch(repo: &Repository, branch: &str) -> Option<Oid> {
+    repo.find_branch(branch, git2::BranchType::Local)
+        .ok()
+        .and_then(|b| b.get().target())
+}
+
+/// In-memory conflict detection — identical to repo_handler::detect_conflicts.
+fn detect_conflicts(repo: &Repository, main_oid: Oid, branch_oid: Oid) -> (bool, Vec<String>) {
+    // Branch already an ancestor of main → no conflict possible
+    if repo
+        .merge_base(main_oid, branch_oid)
+        .map(|base| base == branch_oid)
+        .unwrap_or(false)
+    {
+        return (false, vec![]);
+    }
+
+    let main_commit   = match repo.find_commit(main_oid)   { Ok(c) => c, Err(_) => return (false, vec![]) };
+    let branch_commit = match repo.find_commit(branch_oid) { Ok(c) => c, Err(_) => return (false, vec![]) };
+    let main_tree     = match main_commit.tree()            { Ok(t) => t, Err(_) => return (false, vec![]) };
+    let branch_tree   = match branch_commit.tree()          { Ok(t) => t, Err(_) => return (false, vec![]) };
+
+    let base_oid    = match repo.merge_base(main_oid, branch_oid) { Ok(o) => o, Err(_) => return (false, vec![]) };
+    let base_commit = match repo.find_commit(base_oid)  { Ok(c) => c, Err(_) => return (false, vec![]) };
+    let base_tree   = match base_commit.tree()           { Ok(t) => t, Err(_) => return (false, vec![]) };
+
+    let index = match repo.merge_trees(&base_tree, &main_tree, &branch_tree, Some(&MergeOptions::new())) {
+        Ok(idx) => idx,
+        Err(e)  => { tracing::warn!("[merge-consumer] merge_trees failed: {e:#}"); return (false, vec![]); }
+    };
+
+    if !index.has_conflicts() {
+        return (false, vec![]);
+    }
+
+    let conflicting: Vec<String> = index
+        .conflicts()
+        .map(|conflicts| {
+            conflicts
+                .filter_map(|c| {
+                    let entry = c.ok()?;
+                    let path  = entry.our.or(entry.their).or(entry.ancestor)?;
+                    String::from_utf8(path.path).ok()
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    (!conflicting.is_empty(), conflicting)
+}
+
 // ── Lock helpers ──────────────────────────────────────────────────────────────
 
-/// Delete both Redis keys that constitute the server lock.
 async fn release_lock(redis: &redis::aio::ConnectionManager) {
     let mut conn = redis.clone();
-
     match conn.del::<_, u64>(&[SERVER_LOCK_KEY, CURRENT_MERGE_KEY]).await {
         Ok(n)  => tracing::info!("[merge-consumer] lock released ({n} key(s) deleted)"),
         Err(e) => tracing::error!("[merge-consumer] failed to release lock: {e:#}"),

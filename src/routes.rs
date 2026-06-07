@@ -233,8 +233,8 @@ pub fn build(
         .and(with_state(state.clone()))
         .and_then(handle_squash);
 
-    // POST /repo/merge-queue
-    let merge_queue = warp::path!("repo" / "merge-queue")
+    // POST /org/merge-queue
+    let merge_queue = warp::path!("org" / "merge-queue")
         .and(warp::post())
         .and(warp::body::content_length_limit(64 * 1024))
         .and(warp::body::json())
