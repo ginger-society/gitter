@@ -1,3 +1,4 @@
+#[path = "../pipeline_hook/mod.rs"]
 mod pipeline_hook;
 
 use pipeline_hook::pipeline;

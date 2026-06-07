@@ -18,6 +18,10 @@ use crate::handler_create_db_taskrun::{
     __path_handle_create_db_taskrun, __path_handle_db_taskrun_logs,
     handle_create_db_taskrun, handle_db_taskrun_logs,
 };
+use crate::handler_trigger_pipeline::{
+    __path_handle_trigger_pipeline, handle_trigger_pipeline,
+    TriggerPipelineRequest, TriggerPipelineResponse,
+};
 use crate::merge_queue_handler::{
     __path_handle_merge_queue, handle_merge_queue,
     MergeQueueConflict, MergeQueueRequest, MergeQueueResponse,
@@ -56,6 +60,7 @@ use crate::state::AppState;
         handle_org_commits,
         handle_squash,
         handle_merge_queue,
+        handle_trigger_pipeline,
     ),
     components(schemas(
         AddMemberRequest,
@@ -87,6 +92,8 @@ use crate::state::AppState;
         MergeQueueRequest,
         MergeQueueResponse,
         MergeQueueConflict,
+        TriggerPipelineRequest,
+        TriggerPipelineResponse,
     )),
     modifiers(&SecurityAddon),
 )]
@@ -242,6 +249,14 @@ pub fn build(
         .and(with_rabbit(rabbit))
         .and_then(handle_merge_queue);
 
+    // POST /repo/trigger-pipeline
+    let trigger_pipeline = warp::path!("repo" / "trigger-pipeline")
+        .and(warp::post())
+        .and(warp::body::content_length_limit(64 * 1024))
+        .and(warp::body::json())
+        .and(with_state(state.clone()))
+        .and_then(handle_trigger_pipeline);
+
     // GET /healthz  — no auth, k8s liveness probe
     let health = warp::get()
         .and(warp::path("healthz"))
@@ -276,6 +291,7 @@ pub fn build(
         .or(org_commits)
         .or(squash)
         .or(merge_queue)
+        .or(trigger_pipeline)
         .or(health)
         .or(api_doc)
         .or(swagger_ui)
