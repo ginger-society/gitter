@@ -63,10 +63,9 @@ spec:
   storageClassName: ""
   nfs:
     server: 172.18.0.1
-    path: /srv/nfs/buildah-cache-{namespace}
+    path: /srv/nfs/buildah-cache
 "#,
         pv_name = pv_name,
-        namespace = namespace,
     );
     kubectl_apply(kubeconfig_yaml, &pv_yaml).map(|out| {
         println!("[ginger-gitter] {}: {}", pv_name, out.trim());
