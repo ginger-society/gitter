@@ -48,11 +48,12 @@ pub fn ensure_namespace(kubeconfig_yaml: &str, namespace: &str) -> Result<(), St
 /// Ensure the cluster-level NFS PersistentVolume for the buildah cache exists.
 /// Cluster-scoped (no namespace). Safe to call on every run — idempotent.
 /// NFS server and path match the cluster runbook: 172.18.0.1:/srv/nfs/buildah-cache
-pub fn ensure_buildah_pv(kubeconfig_yaml: &str) -> Result<(), String> {
-    let pv_yaml = r#"apiVersion: v1
+pub fn ensure_buildah_pv(kubeconfig_yaml: &str, namespace: &str) -> Result<(), String> {
+    let pv_name = format!("buildah-cache-{}-pv", namespace);
+    let pv_yaml = format!(r#"apiVersion: v1
 kind: PersistentVolume
 metadata:
-  name: buildah-cache-pv
+  name: {pv_name}
 spec:
   capacity:
     storage: 100Gi
@@ -62,11 +63,13 @@ spec:
   storageClassName: ""
   nfs:
     server: 172.18.0.1
-    path: /srv/nfs/buildah-cache
-"#;
-
-    kubectl_apply(kubeconfig_yaml, pv_yaml).map(|out| {
-        println!("[ginger-gitter] buildah-cache-pv: {}", out.trim());
+    path: /srv/nfs/buildah-cache-{namespace}
+"#,
+        pv_name = pv_name,
+        namespace = namespace,
+    );
+    kubectl_apply(kubeconfig_yaml, &pv_yaml).map(|out| {
+        println!("[ginger-gitter] {}: {}", pv_name, out.trim());
     })
 }
 
@@ -89,18 +92,22 @@ pub fn ensure_pvcs(kubeconfig_yaml: &str, namespace: &str) -> Result<(), String>
       storage: 20Gi"#,
     )?;
 
-    ensure_single_pvc(
-        kubeconfig_yaml,
-        namespace,
-        "buildah-cache-pvc",
-        r#"spec:
+    let pv_name = format!("buildah-cache-{}-pv", namespace);
+    let buildah_spec = format!(r#"spec:
   accessModes:
     - ReadWriteMany
   resources:
     requests:
       storage: 100Gi
   storageClassName: ""
-  volumeName: buildah-cache-pv"#,
+  volumeName: {pv_name}"#,
+        pv_name = pv_name,
+    );
+    ensure_single_pvc(
+        kubeconfig_yaml,
+        namespace,
+        "buildah-cache-pvc",
+        &buildah_spec,
     )?;
 
     Ok(())

@@ -220,7 +220,7 @@ fn trigger_pipeline(
     // buildah-cache-pv must exist at cluster scope before buildah-cache-pvc
     // can bind. ensure_buildah_pv is idempotent — no-ops if PV already exists.
     println!("[ginger-gitter] Ensuring buildah-cache-pv (cluster-level NFS PV) …");
-    ensure_buildah_pv(tekton_kubeconfig)
+    ensure_buildah_pv(tekton_kubeconfig, &namespace)
         .map_err(|e| format!("failed to ensure buildah-cache-pv: {}", e))?;
 
     println!("[ginger-gitter] Ensuring PVCs in namespace: {}", namespace);

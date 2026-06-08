@@ -309,7 +309,8 @@ pub async fn handle_run_pipeline(
     kubectl_step!("namespace", move || ensure_namespace(&kc1, &ns1));
 
     let kc2 = tekton_kubeconfig.clone();
-    kubectl_step!("buildah-cache-pv", move || ensure_buildah_pv(&kc2));
+    let ns2 = namespace.clone();
+    kubectl_step!("buildah-cache-pv", move || ensure_buildah_pv(&kc2, &ns2));
 
     let kc3 = tekton_kubeconfig.clone();
     let ns3 = namespace.clone();
