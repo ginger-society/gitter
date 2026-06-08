@@ -22,6 +22,12 @@ use crate::handler_trigger_pipeline::{
     __path_handle_trigger_pipeline, handle_trigger_pipeline,
     TriggerPipelineRequest, TriggerPipelineResponse,
 };
+
+use crate::handle_run_pipeline::{
+    __path_handle_run_pipeline, handle_run_pipeline, RunPipelineRequest,
+    RunPipelineResponse, PipelineParam
+};
+
 use crate::merge_queue_handler::{
     __path_handle_merge_queue, handle_merge_queue,
     MergeQueueConflict, MergeQueueRequest, MergeQueueResponse,
@@ -61,6 +67,7 @@ use crate::state::AppState;
         handle_squash,
         handle_merge_queue,
         handle_trigger_pipeline,
+        handle_run_pipeline
     ),
     components(schemas(
         AddMemberRequest,
@@ -94,6 +101,9 @@ use crate::state::AppState;
         MergeQueueConflict,
         TriggerPipelineRequest,
         TriggerPipelineResponse,
+        RunPipelineRequest,
+        RunPipelineResponse,
+        PipelineParam
     )),
     modifiers(&SecurityAddon),
 )]
@@ -257,6 +267,14 @@ pub fn build(
         .and(with_state(state.clone()))
         .and_then(handle_trigger_pipeline);
 
+    // POST /repo/run-pipeline
+    let run_pipeline = warp::path!("repo" / "run-pipeline")
+        .and(warp::post())
+        .and(warp::body::content_length_limit(64 * 1024))
+        .and(warp::body::json())
+        .and(with_state(state.clone()))
+        .and_then(handle_run_pipeline);
+
     // GET /healthz  — no auth, k8s liveness probe
     let health = warp::get()
         .and(warp::path("healthz"))
@@ -292,6 +310,7 @@ pub fn build(
         .or(squash)
         .or(merge_queue)
         .or(trigger_pipeline)
+        .or(run_pipeline)
         .or(health)
         .or(api_doc)
         .or(swagger_ui)
