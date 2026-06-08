@@ -122,6 +122,12 @@ pub fn should_trigger(
             );
             return false;
         }
+    }else{
+        println!(
+            "[ginger-gitter]   {} — no trigger branches specified, probably only supposed to be triggered manually via API calls, skipping on push",
+            pipeline.name
+        );
+        return false
     }
     if !pipeline.ignore_paths.is_empty() {
         let all_ignored = changed_files
