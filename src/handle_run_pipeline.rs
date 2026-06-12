@@ -528,17 +528,13 @@ pub async fn handle_run_pipeline(
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-fn resolve_head(repo_path: &PathBuf, git_ref: &str) -> Result<String, String> {
-    let out = Command::new("git")
-        .args(["rev-parse", git_ref])
-        .env("GIT_DIR", repo_path)
-        .output()
-        .map_err(|e| format!("git rev-parse failed to spawn: {e}"))?;
-
-    if !out.status.success() {
-        return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
-    }
-    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+pub fn resolve_head(repo_path: &PathBuf, git_ref: &str) -> Result<String, String> {
+    let repo = git2::Repository::open_bare(repo_path)
+        .map_err(|e| format!("failed to open repo: {e}"))?;
+    let obj = repo
+        .revparse_single(git_ref)
+        .map_err(|e| e.to_string())?;
+    Ok(obj.id().to_string())
 }
 
 /// Extract `metadata.name` from a YAML string (simple line scan, no full parse).

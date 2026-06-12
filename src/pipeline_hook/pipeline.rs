@@ -7,13 +7,12 @@ use crate::pipeline_hook::gitops::{
 };
 use crate::pipeline_hook::kubectl::{
     create_pipeline_run, ensure_buildah_pv, ensure_deployment_target_secret,
-    ensure_ginger_token_secret, ensure_namespace, ensure_pvcs, kubectl_apply,
+    ensure_ginger_token_secret, ensure_namespace, ensure_pvcs, kubectl_apply, rt,
 };
 use crate::pipeline_hook::types::{PipelineDefinition, PipelineRunContext};
 use crate::pipeline_hook::yaml::{parse_pipeline_yaml, should_trigger};
 use crate::pipeline_hook::yaml_transform::{
-    build_pipeline_run, builtin_clone_task, builtin_init_credentials_task, transform_pipeline,
-    transform_task,
+    build_pipeline_run, builtin_clone_task, builtin_init_credentials_task, sanitize_label, transform_pipeline, transform_task
 };
 
 pub fn run(
@@ -335,100 +334,106 @@ fn trigger_pipeline(
 }
 
 /// Cancel any currently-running PipelineRuns for this pipeline (concurrency: cancel-previous).
+/// Cancel any currently-running PipelineRuns for this pipeline (concurrency: cancel-previous).
 fn cancel_running_pipeline_runs(
     tekton_kubeconfig: &str,
     namespace: &str,
     pipeline_name: &str,
     ctx: &PipelineRunContext,
 ) -> Result<(), String> {
-    use std::process::Command;
+    use kube::api::{Api, ListParams, Patch, PatchParams};
+    use kube::config::{KubeConfigOptions, Kubeconfig};
+    use kube::{Client, Config as KubeConfig, ResourceExt};
 
     println!(
-        "[ginger-gitter] Checking for running PipelineRuns to cancel (pipeline={}, repo={})",
+        "[ginger-gitter] Checking for running PipelineRuns to cancel \
+         (pipeline={}, repo={})",
         pipeline_name, ctx.gl_repo
     );
 
-    let kc_path = {
-        use std::fs;
-        use std::io::Write;
-        let path = std::env::temp_dir().join(format!(
-            "ginger-gitter-cancel-kc-{}.yaml",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .subsec_nanos()
-        ));
-        let mut f = fs::File::create(&path)
-            .map_err(|e| format!("failed to create temp kubeconfig for cancel: {}", e))?;
-        f.write_all(tekton_kubeconfig.as_bytes())
-            .map_err(|e| format!("failed to write kubeconfig for cancel: {}", e))?;
-        path
-    };
+    let repo_label = sanitize_label(&ctx.gl_repo);
 
-    let cleanup_kc = || {
-        let _ = std::fs::remove_file(&kc_path);
-    };
+    rt().block_on(async {
+        // ── Build client ──────────────────────────────────────────────────────
+        let kc: Kubeconfig = serde_yaml::from_str(tekton_kubeconfig)
+            .map_err(|e| format!("failed to parse kubeconfig: {e}"))?;
+        let cfg = KubeConfig::from_custom_kubeconfig(kc, &KubeConfigOptions::default())
+            .await
+            .map_err(|e| format!("failed to build kube config: {e}"))?;
+        let client = Client::try_from(cfg)
+            .map_err(|e| format!("failed to create kube client: {e}"))?;
 
-    // List running PipelineRuns with matching pipeline label
-    let output = Command::new("kubectl")
-        .args([
-            "--kubeconfig", kc_path.to_str().unwrap_or("/tmp/kc.yaml"),
-            "get", "pipelinerun",
-            "-n", namespace,
-            "-l", &format!("tekton.dev/pipeline={},ginger-gitter/repo={}", pipeline_name, ctx.gl_repo.replace('/', "-").replace('_', "-")),
-            "--field-selector", "status.conditions[0].reason=Running",
-            "-o", "jsonpath={.items[*].metadata.name}",
-        ])
-        .output()
-        .map_err(|e| {
-            cleanup_kc();
-            format!("failed to list PipelineRuns: {}", e)
-        })?;
+        // ── Dynamic API for PipelineRun (Tekton CRD) ──────────────────────────
+        let ar = kube::discovery::ApiResource {
+            group:       "tekton.dev".to_string(),
+            version:     "v1beta1".to_string(),
+            api_version: "tekton.dev/v1beta1".to_string(),
+            kind:        "PipelineRun".to_string(),
+            plural:      "pipelineruns".to_string(),
+        };
+        let api: Api<kube::core::DynamicObject> =
+            Api::namespaced_with(client, namespace, &ar);
 
-    let names_str = String::from_utf8_lossy(&output.stdout);
-    let names: Vec<&str> = names_str
-        .split_whitespace()
-        .filter(|n| !n.is_empty())
-        .collect();
+        // ── List by label selector ────────────────────────────────────────────
+        // Matches what the pipeline hook writes when it creates PipelineRuns.
+        let label_selector = format!(
+            "tekton.dev/pipeline={},ginger-gitter/repo={}",
+            pipeline_name, repo_label
+        );
+        let lp = ListParams::default().labels(&label_selector);
+        let list = api
+            .list(&lp)
+            .await
+            .map_err(|e| format!("failed to list PipelineRuns: {e}"))?;
 
-    if names.is_empty() {
-        println!("[ginger-gitter] No running PipelineRuns to cancel");
-        cleanup_kc();
-        return Ok(());
-    }
+        if list.items.is_empty() {
+            println!("[ginger-gitter] No PipelineRuns found for label selector '{label_selector}'");
+            return Ok(());
+        }
 
-    for name in &names {
-        println!("[ginger-gitter] Cancelling PipelineRun: {}", name);
-        let patch = r#"{"spec":{"status":"CancelledRunFinally"}}"#;
-        let cancel_out = Command::new("kubectl")
-            .args([
-                "--kubeconfig", kc_path.to_str().unwrap_or("/tmp/kc.yaml"),
-                "patch", "pipelinerun", name,
-                "-n", namespace,
-                "--type=merge",
-                "-p", patch,
-            ])
-            .output();
+        // ── Filter to only Running ones ───────────────────────────────────────
+        // Tekton marks running PipelineRuns with:
+        //   .status.conditions[0].reason == "Running"
+        // We check this in the JSON data rather than via a field-selector
+        // (field selectors on CRD status fields are not supported by Tekton).
+        let running: Vec<_> = list
+            .items
+            .iter()
+            .filter(|pr| {
+                pr.data["status"]["conditions"]
+                    .as_array()
+                    .and_then(|conds| conds.first())
+                    .and_then(|c| c["reason"].as_str())
+                    == Some("Running")
+            })
+            .collect();
 
-        match cancel_out {
-            Ok(o) if o.status.success() => {
-                println!("[ginger-gitter] ✓ Cancelled: {}", name);
-            }
-            Ok(o) => {
-                println!(
-                    "[ginger-gitter] WARNING: failed to cancel {}: {}",
-                    name,
-                    String::from_utf8_lossy(&o.stderr).trim()
-                );
-            }
-            Err(e) => {
-                println!("[ginger-gitter] WARNING: error cancelling {}: {}", name, e);
+        if running.is_empty() {
+            println!("[ginger-gitter] No running PipelineRuns to cancel");
+            return Ok(());
+        }
+
+        // ── Patch each running PipelineRun to CancelledRunFinally ─────────────
+        let patch_params = PatchParams::default();
+        let cancel_patch: serde_json::Value =
+            serde_json::json!({ "spec": { "status": "CancelledRunFinally" } });
+
+        for pr in running {
+            let name = pr.name_any();
+            println!("[ginger-gitter] Cancelling PipelineRun: {name}");
+            match api
+                .patch(&name, &patch_params, &Patch::Merge(&cancel_patch))
+                .await
+            {
+                Ok(_) => println!("[ginger-gitter] ✓ Cancelled: {name}"),
+                Err(e) => println!(
+                    "[ginger-gitter] WARNING: failed to cancel {name}: {e:#}"
+                ),
             }
         }
-    }
 
-    cleanup_kc();
-    Ok(())
+        Ok(())
+    })
 }
 
 fn parse_pipeline_files(

@@ -9,7 +9,7 @@ use std::process::Command;
 use tracing::{error, info, warn};
 use warp::http::StatusCode;
 
-use crate::state::AppState;
+use crate::{handle_run_pipeline::resolve_head, state::AppState};
 
 const REPOS_DIR: &str = "/home/git/repositories";
 const ADMIN_GIT_DIR: &str = "/home/git/repositories/gitolite-admin.git";
@@ -143,19 +143,6 @@ pub async fn handle_trigger_pipeline(
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-/// Resolve the HEAD commit SHA for a ref in a bare repo.
-fn resolve_head(repo_path: &PathBuf, git_ref: &str) -> Result<String, String> {
-    let out = Command::new("git")
-        .args(["rev-parse", git_ref])
-        .env("GIT_DIR", repo_path)
-        .output()
-        .map_err(|e| format!("git rev-parse failed to spawn: {e}"))?;
-
-    if !out.status.success() {
-        return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
-    }
-    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
-}
 
 fn err(
     code: StatusCode,

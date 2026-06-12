@@ -19,7 +19,7 @@ use kube::{Client, Config as KubeConfig, ResourceExt};
 
 // ── Runtime helper ────────────────────────────────────────────────────────────
 
-fn rt() -> tokio::runtime::Runtime {
+pub fn rt() -> tokio::runtime::Runtime {
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
