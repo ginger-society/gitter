@@ -340,27 +340,6 @@ fn merge(repo_name: &str, branch: &str, merge_request_id: &str) -> anyhow::Resul
     Ok(())
 }
 
-/// Push a single refspec from the bare repo using the system `git` binary.
-/// We use the subprocess here because git2's remote push with SSH credentials
-/// requires a callback setup that mirrors the gitolite SSH config; it's simpler
-/// to shell out to `git push` which already inherits the environment.
-fn push_ref(repo_name: &str, refspec: &str) -> anyhow::Result<()> {
-    let path = PathBuf::from(REPOS_ROOT).join(format!("{}.git", repo_name.trim_end_matches(".git")));
-
-    let output = std::process::Command::new("git")
-        .args(["push", "origin", refspec])
-        .current_dir(&path)
-        .output()
-        .map_err(|e| anyhow::anyhow!("failed to spawn git push: {e:#}"))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!("git push '{}' failed:\n{}", refspec, stderr);
-    }
-
-    Ok(())
-}
-
 // ── git2 helpers ──────────────────────────────────────────────────────────────
 
 fn open_repo(repo_name: &str) -> anyhow::Result<Repository> {

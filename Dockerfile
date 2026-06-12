@@ -9,23 +9,6 @@ RUN git clone https://github.com/sitaramc/gitolite /opt/gitolite && \
 RUN adduser -D -s /bin/bash git && \
     passwd -u git || true
 
-# ── kubectl ───────────────────────────────────────────────────────────────────
-# Download the latest stable kubectl binary for the host architecture.
-# The binary lands at /usr/local/bin/kubectl — the path probed first by
-# find_kubectl() in the pipeline hook, so no PATH tricks are needed.
-RUN set -eux; \
-    ARCH=$(uname -m); \
-    case "$ARCH" in \
-      x86_64)  KUBECTL_ARCH=amd64 ;; \
-      aarch64) KUBECTL_ARCH=arm64 ;; \
-      armv7l)  KUBECTL_ARCH=arm ;; \
-      *)        echo "Unsupported arch: $ARCH" >&2; exit 1 ;; \
-    esac; \
-    KUBECTL_VERSION=$(curl -fsSL https://dl.k8s.io/release/stable.txt); \
-    curl -fsSL "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/${KUBECTL_ARCH}/kubectl" \
-         -o /usr/local/bin/kubectl; \
-    chmod 755 /usr/local/bin/kubectl; \
-    kubectl version --client
 
 # CA public key
 COPY signing-keys/ca_key.pub /etc/ssh/ca_key.pub

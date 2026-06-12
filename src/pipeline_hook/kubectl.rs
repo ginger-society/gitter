@@ -1,56 +1,95 @@
-use std::io::Write;
-use std::path::Path;
-use std::process::Command;
+/// Blocking Kubernetes helpers used by the pipeline hook binary.
+///
+/// The git-hook binary (`ginger-gitter-pipeline-hook`) has no async runtime,
+/// so every helper here creates a single-threaded Tokio runtime and blocks on
+/// the async kube calls. This keeps the public API synchronous while using the
+/// same `kube` / `k8s-openapi` stack as the sidecar.
 
-use tempfile::NamedTempFile;
+use std::collections::BTreeMap;
 
-/// Locate the kubectl binary. Git hooks run with a minimal PATH so we probe
-/// common install locations explicitly before falling back to a PATH lookup.
-fn find_kubectl() -> std::path::PathBuf {
-    const CANDIDATES: &[&str] = &[
-        "/usr/local/bin/kubectl",
-        "/usr/bin/kubectl",
-        "/bin/kubectl",
-        "/snap/bin/kubectl",
-        "/opt/homebrew/bin/kubectl",
-    ];
-    for path in CANDIDATES {
-        if Path::new(path).exists() {
-            return std::path::PathBuf::from(path);
-        }
-    }
-    std::path::PathBuf::from("kubectl")
+use k8s_openapi::api::core::v1::{
+    Namespace, PersistentVolumeClaim, PersistentVolumeClaimSpec, PersistentVolume,
+    VolumeResourceRequirements, Secret,
+};
+use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
+use kube::api::{Api, DeleteParams, Patch, PatchParams, PostParams};
+use kube::config::{KubeConfigOptions, Kubeconfig};
+use kube::{Client, Config as KubeConfig, ResourceExt};
+
+// ── Runtime helper ────────────────────────────────────────────────────────────
+
+fn rt() -> tokio::runtime::Runtime {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("failed to build tokio runtime")
 }
 
-/// Write kubeconfig content to a NamedTempFile.
-/// The file is automatically deleted when the returned value is dropped.
-fn write_kubeconfig(content: &str) -> Result<NamedTempFile, String> {
-    let mut f = NamedTempFile::new()
-        .map_err(|e| format!("failed to create temp kubeconfig: {e}"))?;
-    f.write_all(content.as_bytes())
-        .map_err(|e| format!("failed to write temp kubeconfig: {e}"))?;
-    Ok(f)
+// ── Client construction ───────────────────────────────────────────────────────
+
+async fn client_from_kubeconfig_async(kubeconfig_yaml: &str) -> Result<Client, String> {
+    let kc: Kubeconfig = serde_yaml::from_str(kubeconfig_yaml)
+        .map_err(|e| format!("failed to parse kubeconfig: {e}"))?;
+    let opts = KubeConfigOptions::default();
+    let cfg = KubeConfig::from_custom_kubeconfig(kc, &opts)
+        .await
+        .map_err(|e| format!("failed to build kube config: {e}"))?;
+    Client::try_from(cfg).map_err(|e| format!("failed to create kube client: {e}"))
 }
 
-/// Write kubeconfig to a temp file, run kubectl apply with it, then clean up.
-/// Returns stdout on success, Err with stderr on failure.
+fn client_from_kubeconfig(kubeconfig_yaml: &str) -> Result<Client, String> {
+    rt().block_on(client_from_kubeconfig_async(kubeconfig_yaml))
+}
+
+// ── Public surface (all blocking) ─────────────────────────────────────────────
+
+/// Apply a raw YAML string via server-side apply.
+/// Returns stdout-like confirmation string on success.
 pub fn kubectl_apply(kubeconfig_yaml: &str, resource_yaml: &str) -> Result<String, String> {
-    let kc_file = write_kubeconfig(kubeconfig_yaml)?;
-    run_kubectl_apply(kc_file.path(), resource_yaml)
+    rt().block_on(apply_dynamic(kubeconfig_yaml, resource_yaml))
 }
 
 /// Ensure a Kubernetes namespace exists (idempotent).
 pub fn ensure_namespace(kubeconfig_yaml: &str, namespace: &str) -> Result<(), String> {
-    let kc_file = write_kubeconfig(kubeconfig_yaml)?;
-    run_kubectl_ensure_namespace(kc_file.path(), namespace)
+    rt().block_on(async {
+        let client = client_from_kubeconfig_async(kubeconfig_yaml).await?;
+        let api: Api<Namespace> = Api::all(client);
+
+        let ns = Namespace {
+            metadata: ObjectMeta {
+                name: Some(namespace.to_string()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let params = PatchParams::apply("ginger-gitter").force();
+        api.patch(namespace, &params, &Patch::Apply(&ns))
+            .await
+            .map_err(|e| format!("failed to ensure namespace {namespace}: {e}"))?;
+
+        println!("[ginger-gitter] Namespace {namespace} ensured");
+        Ok(())
+    })
 }
 
 /// Ensure the cluster-level NFS PersistentVolume for the buildah cache exists.
-/// Cluster-scoped (no namespace). Safe to call on every run — idempotent.
-/// NFS server and path match the cluster runbook: 172.18.0.1:/srv/nfs/buildah-cache
 pub fn ensure_buildah_pv(kubeconfig_yaml: &str, namespace: &str) -> Result<(), String> {
-    let pv_name = format!("buildah-cache-{}-pv", namespace);
-    let pv_yaml = format!(r#"apiVersion: v1
+    let pv_name = format!("buildah-cache-{namespace}-pv");
+
+    rt().block_on(async {
+        let client = client_from_kubeconfig_async(kubeconfig_yaml).await?;
+        let api: Api<PersistentVolume> = Api::all(client);
+
+        // Check if it already exists
+        if api.get_opt(&pv_name).await.map_err(|e| e.to_string())?.is_some() {
+            println!("[ginger-gitter] PV {pv_name} already exists — skipping");
+            return Ok(());
+        }
+
+        let pv_yaml = format!(
+            r#"apiVersion: v1
 kind: PersistentVolume
 metadata:
   name: {pv_name}
@@ -64,196 +103,84 @@ spec:
   nfs:
     server: 172.18.0.1
     path: /srv/nfs/buildah-cache
-"#,
-        pv_name = pv_name,
-    );
-    kubectl_apply(kubeconfig_yaml, &pv_yaml).map(|out| {
-        println!("[ginger-gitter] {}: {}", pv_name, out.trim());
+"#
+        );
+
+        apply_dynamic(kubeconfig_yaml, &pv_yaml).await.map(|out| {
+            println!("[ginger-gitter] {pv_name}: {out}");
+        })
     })
 }
 
 /// Ensure namespace-scoped PVCs exist and are Bound.
-/// Call after ensure_buildah_pv so the NFS PV is ready before the PVC binds.
-///
-/// PVCs are immutable once created — we can't apply changes to a stuck Pending
-/// PVC. Instead we check status: if Pending we delete and recreate it so it
-/// gets a fresh binding attempt against the now-present PV.
 pub fn ensure_pvcs(kubeconfig_yaml: &str, namespace: &str) -> Result<(), String> {
-    ensure_single_pvc(
-        kubeconfig_yaml,
-        namespace,
-        "general-purpose-cache-pvc",
-        r#"spec:
-  accessModes:
-    - ReadWriteOnce
-  resources:
-    requests:
-      storage: 20Gi"#,
-    )?;
+    let pv_name = format!("buildah-cache-{namespace}-pv");
 
-    let pv_name = format!("buildah-cache-{}-pv", namespace);
-    let buildah_spec = format!(r#"spec:
-  accessModes:
-    - ReadWriteMany
-  resources:
-    requests:
-      storage: 100Gi
-  storageClassName: ""
-  volumeName: {pv_name}"#,
-        pv_name = pv_name,
-    );
-    ensure_single_pvc(
-        kubeconfig_yaml,
-        namespace,
-        "buildah-cache-pvc",
-        &buildah_spec,
-    )?;
+    rt().block_on(async {
+        // general-purpose-cache-pvc (ReadWriteOnce, 20Gi)
+        ensure_single_pvc_async(
+            kubeconfig_yaml,
+            namespace,
+            "general-purpose-cache-pvc",
+            "20Gi",
+            vec!["ReadWriteOnce".to_string()],
+            None,
+            None,
+        )
+        .await?;
 
-    Ok(())
-}
-
-/// Create a PVC if it doesn't exist, or recreate it if it's stuck in Pending.
-/// Bound PVCs are left completely untouched.
-fn ensure_single_pvc(
-    kubeconfig_yaml: &str,
-    namespace: &str,
-    name: &str,
-    spec_yaml: &str,
-) -> Result<(), String> {
-    let kubectl = find_kubectl();
-    // Single temp file reused for all kubectl calls in this function.
-    // Dropped (and deleted) automatically at end of scope.
-    let kc_file = write_kubeconfig(kubeconfig_yaml)?;
-    let kc_path = kc_file.path().to_str().unwrap_or("/tmp/kc.yaml");
-
-    // Check current status
-    let status_out = Command::new(&kubectl)
-        .args([
-            "--kubeconfig", kc_path,
-            "get", "pvc", name,
-            "-n", namespace,
-            "-o", "jsonpath={.status.phase}",
-            "--ignore-not-found",
-        ])
-        .output()
-        .map_err(|e| format!("failed to check PVC {}: {}", name, e))?;
-
-    let phase = String::from_utf8_lossy(&status_out.stdout).trim().to_string();
-
-    match phase.as_str() {
-        "Bound" => {
-            println!("[ginger-gitter] PVC {} already Bound — skipping", name);
-            return Ok(());
-        }
-        "Pending" => {
-            println!(
-                "[ginger-gitter] PVC {} stuck in Pending — deleting for recreation",
-                name
-            );
-            let _ = Command::new(&kubectl)
-                .args([
-                    "--kubeconfig", kc_path,
-                    "delete", "pvc", name,
-                    "-n", namespace,
-                    "--wait=false",
-                ])
-                .output();
-        }
-        "" => {
-            println!("[ginger-gitter] PVC {} not found — creating", name);
-        }
-        other => {
-            println!("[ginger-gitter] PVC {} status: {} — recreating", name, other);
-            let _ = Command::new(&kubectl)
-                .args([
-                    "--kubeconfig", kc_path,
-                    "delete", "pvc", name,
-                    "-n", namespace,
-                    "--wait=false",
-                ])
-                .output();
-        }
-    }
-
-    let pvc_yaml = format!(
-        "apiVersion: v1
-kind: PersistentVolumeClaim
-metadata:
-  name: {name}
-  namespace: {namespace}
-{spec_yaml}
-",
-        name = name,
-        namespace = namespace,
-        spec_yaml = spec_yaml,
-    );
-
-    let mut child = Command::new(&kubectl)
-        .args([
-            "--kubeconfig", kc_path,
-            "create", "-f", "-",
-        ])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("failed to spawn kubectl create pvc: {}", e))?;
-
-    if let Some(mut stdin) = child.stdin.take() {
-        stdin.write_all(pvc_yaml.as_bytes())
-            .map_err(|e| format!("failed to write PVC yaml: {}", e))?;
-    }
-
-    let out = child.wait_with_output()
-        .map_err(|e| format!("kubectl create pvc wait failed: {}", e))?;
-
-    if out.status.success() {
-        println!("[ginger-gitter] ✓ PVC {} created", name);
-        Ok(())
-    } else {
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        if stderr.contains("already exists") {
-            println!("[ginger-gitter] PVC {} already exists (race) — ok", name);
-            return Ok(());
-        }
-        Err(format!("failed to create PVC {}: {}", name, stderr.trim()))
-    }
+        // buildah-cache-pvc (ReadWriteMany, 100Gi, bound to the NFS PV)
+        ensure_single_pvc_async(
+            kubeconfig_yaml,
+            namespace,
+            "buildah-cache-pvc",
+            "100Gi",
+            vec!["ReadWriteMany".to_string()],
+            Some(String::new()),     // storageClassName: ""
+            Some(pv_name),
+        )
+        .await
+    })
 }
 
 /// Ensure the `ginger-token-secret` Secret exists in the namespace.
-/// The token is the raw string from the admin repo's pipeline-tokens/<workspace>.
 pub fn ensure_ginger_token_secret(
     kubeconfig_yaml: &str,
     namespace: &str,
     token: &str,
 ) -> Result<(), String> {
-    use base64::{engine::general_purpose::STANDARD, Engine};
-    let token_b64 = STANDARD.encode(token.trim().as_bytes());
+    rt().block_on(async {
+        let client = client_from_kubeconfig_async(kubeconfig_yaml).await?;
+        let api: Api<Secret> = Api::namespaced(client, namespace);
 
-    let secret_yaml = format!(
-        r#"apiVersion: v1
-kind: Secret
-metadata:
-  name: ginger-token-secret
-  namespace: {namespace}
-type: Opaque
-data:
-  token: {token_b64}
-"#,
-        namespace = namespace,
-        token_b64 = token_b64
-    );
+        let token_bytes = token.trim().as_bytes().to_vec();
 
-    kubectl_apply(kubeconfig_yaml, &secret_yaml).map(|out| {
-        println!("[ginger-gitter] Secret apply output: {}", out.trim());
+        let secret = Secret {
+            metadata: ObjectMeta {
+                name: Some("ginger-token-secret".to_string()),
+                namespace: Some(namespace.to_string()),
+                ..Default::default()
+            },
+            type_: Some("Opaque".to_string()),
+            data: Some(BTreeMap::from([(
+                "token".to_string(),
+                k8s_openapi::ByteString(token_bytes),
+            )])),
+            ..Default::default()
+        };
+
+        let params = PatchParams::apply("ginger-gitter").force();
+        api.patch("ginger-token-secret", &params, &Patch::Apply(&secret))
+            .await
+            .map_err(|e| format!("failed to ensure ginger-token-secret in {namespace}: {e}"))?;
+
+        println!("[ginger-gitter] Secret ginger-token-secret ensured in {namespace}");
+        Ok(())
     })
 }
 
 /// Ensure a deployment-target kubeconfig Secret exists in the namespace.
-/// Named after the branch so concurrent pipelines on different branches
-/// never clash: deployment-target-dev-alice, deployment-target-main, etc.
-/// Safe to call on every push — overwrites with the latest kubeconfig.
-/// When kubeconfig is None (no environment provisioned yet) this is a no-op.
+/// No-op when `deployment_kubeconfig` is None.
 pub fn ensure_deployment_target_secret(
     tekton_kubeconfig: &str,
     namespace: &str,
@@ -264,168 +191,264 @@ pub fn ensure_deployment_target_secret(
         Some(kc) => kc,
         None => {
             println!(
-                "[ginger-gitter] No deployment target kubeconfig — skipping secret '{}'",
-                secret_name
+                "[ginger-gitter] No deployment target kubeconfig — skipping secret '{secret_name}'"
             );
             return Ok(());
         }
     };
 
-    use base64::{engine::general_purpose::STANDARD, Engine};
-    let kc_b64 = STANDARD.encode(kc.as_bytes());
+    let kc_bytes = kc.as_bytes().to_vec();
 
-    let secret_yaml = format!(
-        r#"apiVersion: v1
-kind: Secret
-metadata:
-  name: {secret_name}
-  namespace: {namespace}
-  labels:
-    ginger-gitter/secret-type: deployment-target
-type: Opaque
-data:
-  kubeconfig.yaml: {kc_b64}
-"#,
-        secret_name = secret_name,
-        namespace = namespace,
-        kc_b64 = kc_b64,
-    );
+    rt().block_on(async {
+        let client = client_from_kubeconfig_async(tekton_kubeconfig).await?;
+        let api: Api<Secret> = Api::namespaced(client, namespace);
 
-    kubectl_apply(tekton_kubeconfig, &secret_yaml).map(|out| {
-        println!(
-            "[ginger-gitter] ✓ Deployment target secret '{}' applied: {}",
-            secret_name,
-            out.trim()
+        let mut labels = BTreeMap::new();
+        labels.insert(
+            "ginger-gitter/secret-type".to_string(),
+            "deployment-target".to_string(),
         );
+
+        let secret = Secret {
+            metadata: ObjectMeta {
+                name: Some(secret_name.to_string()),
+                namespace: Some(namespace.to_string()),
+                labels: Some(labels),
+                ..Default::default()
+            },
+            type_: Some("Opaque".to_string()),
+            data: Some(BTreeMap::from([(
+                "kubeconfig.yaml".to_string(),
+                k8s_openapi::ByteString(kc_bytes),
+            )])),
+            ..Default::default()
+        };
+
+        let params = PatchParams::apply("ginger-gitter").force();
+        api.patch(secret_name, &params, &Patch::Apply(&secret))
+            .await
+            .map_err(|e| {
+                format!("failed to ensure deployment target secret '{secret_name}': {e}")
+            })?;
+
+        println!(
+            "[ginger-gitter] ✓ Deployment target secret '{secret_name}' applied"
+        );
+        Ok(())
     })
 }
 
-/// Apply a PipelineRun and return the created resource name.
-pub fn create_pipeline_run(kubeconfig_yaml: &str, pipeline_run_yaml: &str) -> Result<String, String> {
-    let kc_file = write_kubeconfig(kubeconfig_yaml)?;
-    run_kubectl_create(kc_file.path(), pipeline_run_yaml)
+/// Create a PipelineRun resource (uses generateName — cannot use apply).
+/// Returns the kubectl-style output: `pipelinerun.tekton.dev/<name>  created`.
+pub fn create_pipeline_run(
+    kubeconfig_yaml: &str,
+    pipeline_run_yaml: &str,
+) -> Result<String, String> {
+    rt().block_on(create_dynamic(kubeconfig_yaml, pipeline_run_yaml))
 }
 
-// ── Internal helpers ──────────────────────────────────────────────────────────
+// ── Internal ──────────────────────────────────────────────────────────────────
 
-fn run_kubectl_apply(kc_path: &Path, resource_yaml: &str) -> Result<String, String> {
-    let kubectl = find_kubectl();
-    let mut child = Command::new(&kubectl)
-        .args([
-            "--kubeconfig",
-            kc_path.to_str().unwrap_or("/tmp/kc.yaml"),
-            "apply",
-            "--server-side",
-            "--force-conflicts",
-            "-f",
-            "-",
-        ])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("failed to spawn kubectl (tried {}): {}", kubectl.display(), e))?;
+/// Server-side apply for any resource kind via the dynamic API.
+async fn apply_dynamic(kubeconfig_yaml: &str, resource_yaml: &str) -> Result<String, String> {
+    let client = client_from_kubeconfig_async(kubeconfig_yaml).await?;
 
-    if let Some(mut stdin) = child.stdin.take() {
-        stdin
-            .write_all(resource_yaml.as_bytes())
-            .map_err(|e| format!("failed to write to kubectl stdin: {}", e))?;
-    }
+    let value: serde_json::Value = serde_yaml::from_str(resource_yaml)
+        .map_err(|e| format!("resource YAML parse error: {e}"))?;
 
-    let output = child
-        .wait_with_output()
-        .map_err(|e| format!("kubectl wait failed: {}", e))?;
+    let api_version = value["apiVersion"]
+        .as_str()
+        .ok_or("missing apiVersion")?
+        .to_string();
+    let kind = value["kind"].as_str().ok_or("missing kind")?.to_string();
+    let name = value["metadata"]["name"]
+        .as_str()
+        .ok_or("missing metadata.name")?
+        .to_string();
+    let namespace_val = value["metadata"]["namespace"]
+        .as_str()
+        .map(str::to_string);
 
-    if output.status.success() {
-        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    let (group, version) = parse_api_version(&api_version);
+    let ar = kube::discovery::ApiResource {
+        group,
+        version,
+        api_version: api_version.clone(),
+        kind: kind.clone(),
+        plural: kind_to_plural(&kind),
+    };
+
+    let mut dobj = kube::core::DynamicObject::new(&name, &ar);
+    dobj.data = value;
+
+    let params = PatchParams::apply("ginger-gitter").force();
+
+    let result_name = if let Some(ns) = namespace_val {
+        let api: Api<kube::core::DynamicObject> = Api::namespaced_with(client, &ns, &ar);
+        api.patch(&name, &params, &Patch::Apply(&dobj))
+            .await
+            .map_err(|e| format!("apply failed for {kind}/{name}: {e}"))?
+            .name_any()
     } else {
-        Err(format!(
-            "kubectl apply failed (exit {}): {}",
-            output.status.code().unwrap_or(-1),
-            String::from_utf8_lossy(&output.stderr).trim()
-        ))
-    }
+        let api: Api<kube::core::DynamicObject> = Api::all_with(client, &ar);
+        api.patch(&name, &params, &Patch::Apply(&dobj))
+            .await
+            .map_err(|e| format!("apply failed for {kind}/{name}: {e}"))?
+            .name_any()
+    };
+
+    println!("[ginger-gitter] {kind}/{result_name} applied");
+    Ok(format!("{kind}/{result_name} applied"))
 }
 
-/// `kubectl create` is used for PipelineRun because it uses generateName —
-/// `apply` does not support generateName.
-fn run_kubectl_create(kc_path: &Path, resource_yaml: &str) -> Result<String, String> {
-    let kubectl = find_kubectl();
-    let mut child = Command::new(&kubectl)
-        .args([
-            "--kubeconfig",
-            kc_path.to_str().unwrap_or("/tmp/kc.yaml"),
-            "create",
-            "-f",
-            "-",
-        ])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("failed to spawn kubectl (tried {}): {}", kubectl.display(), e))?;
+/// Create any resource kind via the dynamic API (for generateName resources).
+async fn create_dynamic(kubeconfig_yaml: &str, resource_yaml: &str) -> Result<String, String> {
+    let client = client_from_kubeconfig_async(kubeconfig_yaml).await?;
 
-    if let Some(mut stdin) = child.stdin.take() {
-        stdin
-            .write_all(resource_yaml.as_bytes())
-            .map_err(|e| format!("failed to write to kubectl stdin: {}", e))?;
-    }
+    let value: serde_json::Value = serde_yaml::from_str(resource_yaml)
+        .map_err(|e| format!("resource YAML parse error: {e}"))?;
 
-    let output = child
-        .wait_with_output()
-        .map_err(|e| format!("kubectl create wait failed: {}", e))?;
+    let api_version = value["apiVersion"]
+        .as_str()
+        .ok_or("missing apiVersion")?
+        .to_string();
+    let kind = value["kind"].as_str().ok_or("missing kind")?.to_string();
+    let namespace_val = value["metadata"]["namespace"]
+        .as_str()
+        .map(str::to_string)
+        .ok_or_else(|| "missing metadata.namespace".to_string())?;
 
-    if output.status.success() {
-        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
-    } else {
-        Err(format!(
-            "kubectl create failed (exit {}): {}",
-            output.status.code().unwrap_or(-1),
-            String::from_utf8_lossy(&output.stderr).trim()
-        ))
-    }
+    let (group, version) = parse_api_version(&api_version);
+    let ar = kube::discovery::ApiResource {
+        group,
+        version,
+        api_version,
+        kind: kind.clone(),
+        plural: kind_to_plural(&kind),
+    };
+
+    let mut dobj = kube::core::DynamicObject::new("", &ar);
+    dobj.data = value;
+
+    let api: Api<kube::core::DynamicObject> =
+        Api::namespaced_with(client, &namespace_val, &ar);
+
+    let created = api
+        .create(&PostParams::default(), &dobj)
+        .await
+        .map_err(|e| format!("create failed for {kind}: {e}"))?;
+
+    let created_name = created.name_any();
+    println!("[ginger-gitter] {kind}/{created_name} created");
+
+    // Return kubectl-style output so callers that parse it still work
+    Ok(format!(
+        "{}.{}/{}  created",
+        kind.to_lowercase(),
+        "tekton.dev",
+        created_name
+    ))
 }
 
-fn run_kubectl_ensure_namespace(kc_path: &Path, namespace: &str) -> Result<(), String> {
-    let ns_yaml = format!(
-        "apiVersion: v1\nkind: Namespace\nmetadata:\n  name: {}\n",
-        namespace
-    );
+async fn ensure_single_pvc_async(
+    kubeconfig_yaml: &str,
+    namespace: &str,
+    name: &str,
+    storage: &str,
+    access_modes: Vec<String>,
+    storage_class_name: Option<String>,
+    volume_name: Option<String>,
+) -> Result<(), String> {
+    let client = client_from_kubeconfig_async(kubeconfig_yaml).await?;
+    let api: Api<PersistentVolumeClaim> = Api::namespaced(client.clone(), namespace);
 
-    let kubectl = find_kubectl();
-    let mut child = Command::new(&kubectl)
-        .args([
-            "--kubeconfig",
-            kc_path.to_str().unwrap_or("/tmp/kc.yaml"),
-            "apply",
-            "-f",
-            "-",
-        ])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("failed to spawn kubectl (tried {}): {}", kubectl.display(), e))?;
-
-    if let Some(mut stdin) = child.stdin.take() {
-        stdin
-            .write_all(ns_yaml.as_bytes())
-            .map_err(|e| format!("failed to write namespace yaml: {}", e))?;
-    }
-
-    let output = child
-        .wait_with_output()
-        .map_err(|e| format!("kubectl namespace wait failed: {}", e))?;
-
-    if output.status.success() {
-        println!("[ginger-gitter] Namespace {} ensured", namespace);
-        Ok(())
-    } else {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        if stderr.contains("already exists") {
-            println!("[ginger-gitter] Namespace {} already exists", namespace);
-            return Ok(());
+    match api.get_opt(name).await {
+        Ok(Some(pvc)) => {
+            let phase = pvc
+                .status
+                .as_ref()
+                .and_then(|s| s.phase.as_deref())
+                .unwrap_or("");
+            match phase {
+                "Bound" => {
+                    println!("[ginger-gitter] PVC {name} already Bound — skipping");
+                    return Ok(());
+                }
+                "Pending" => {
+                    println!("[ginger-gitter] PVC {name} stuck in Pending — deleting for recreation");
+                    api.delete(name, &DeleteParams::default())
+                        .await
+                        .map_err(|e| format!("failed to delete stuck PVC {name}: {e}"))?;
+                }
+                other => {
+                    println!("[ginger-gitter] PVC {name} status: {other} — recreating");
+                    api.delete(name, &DeleteParams::default())
+                        .await
+                        .map_err(|e| format!("failed to delete PVC {name}: {e}"))?;
+                }
+            }
         }
-        Err(format!("kubectl apply namespace failed: {}", stderr.trim()))
+        Ok(None) => println!("[ginger-gitter] PVC {name} not found — creating"),
+        Err(e) => return Err(format!("failed to check PVC {name}: {e}")),
+    }
+
+    let mut requests = BTreeMap::new();
+    requests.insert("storage".to_string(), Quantity(storage.to_string()));
+
+    let pvc = PersistentVolumeClaim {
+        metadata: ObjectMeta {
+            name: Some(name.to_string()),
+            namespace: Some(namespace.to_string()),
+            ..Default::default()
+        },
+        spec: Some(PersistentVolumeClaimSpec {
+            access_modes: Some(access_modes),
+            resources: Some(VolumeResourceRequirements {
+                requests: Some(requests),
+                ..Default::default()
+            }),
+            storage_class_name,
+            volume_name,
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+
+    let api2: Api<PersistentVolumeClaim> = Api::namespaced(client, namespace);
+    match api2.create(&PostParams::default(), &pvc).await {
+        Ok(_) => {
+            println!("[ginger-gitter] ✓ PVC {name} created");
+            Ok(())
+        }
+        Err(kube::Error::Api(ae)) if ae.code == 409 => {
+            println!("[ginger-gitter] PVC {name} already exists (race) — ok");
+            Ok(())
+        }
+        Err(e) => Err(format!("failed to create PVC {name}: {e}")),
+    }
+}
+
+/// Split `apiVersion` into `(group, version)`.
+fn parse_api_version(api_version: &str) -> (String, String) {
+    if let Some((g, v)) = api_version.split_once('/') {
+        (g.to_string(), v.to_string())
+    } else {
+        (String::new(), api_version.to_string())
+    }
+}
+
+/// Best-effort plural form for kinds used in this project.
+fn kind_to_plural(kind: &str) -> String {
+    match kind {
+        "Namespace"             => "namespaces".to_string(),
+        "Secret"                => "secrets".to_string(),
+        "PersistentVolume"      => "persistentvolumes".to_string(),
+        "PersistentVolumeClaim" => "persistentvolumeclaims".to_string(),
+        "Pipeline"              => "pipelines".to_string(),
+        "PipelineRun"           => "pipelineruns".to_string(),
+        "Task"                  => "tasks".to_string(),
+        "TaskRun"               => "taskruns".to_string(),
+        "Pod"                   => "pods".to_string(),
+        other                   => format!("{}s", other.to_lowercase()),
     }
 }
