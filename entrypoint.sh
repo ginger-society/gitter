@@ -35,7 +35,6 @@ if [[ -f "$RC_FILE" ]]; then
 
   # 1. WILDREPOS — uncomment if commented, or add if missing, ensure set to 1.
   if grep -q "WILDREPOS" "$RC_FILE"; then
-    # Uncomment and set to 1 (handles both commented and active lines)
     perl -i -pe "s/^(\s*)#?\s*WILDREPOS\s*=>\s*\d/\${1}WILDREPOS => 1/" "$RC_FILE"
     echo "[entrypoint]   WILDREPOS => 1 ensured"
   else
@@ -45,7 +44,6 @@ if [[ -f "$RC_FILE" ]]; then
 
   # 2. LOCAL_CODE — use hardcoded /home/git path (NOT \$ENV{HOME} which resolves
   #    to /root when run as root, causing Permission denied for the git user).
-  #    Remove all LOCAL_CODE lines (commented or not) and insert the correct one.
   perl -i -ne 'print unless /LOCAL_CODE/' "$RC_FILE"
   perl -i -0777 -pe 'BEGIN{$code=shift} s/(%RC\s*=\s*\()/$1\n    LOCAL_CODE => "$code\/.gitolite\/local",/' \
     "$GIT_HOME" "$RC_FILE"
@@ -96,30 +94,22 @@ HOME=$GIT_HOME su git -s /bin/bash -c "gitolite compile"
   { echo "[entrypoint] ERROR: authorized_keys missing after compile" >&2; exit 1; }
 echo "[entrypoint] authorized_keys ready."
 
-# Propagate hooks into ALL existing repos. This is the critical step that
-# gitolite compile alone does NOT do — setup --hooks-only copies LOCAL_CODE
-# hooks into every repo's hooks/ directory. Without this, post-receive is
-# missing from repos that existed before this entrypoint run.
 echo "[entrypoint] Propagating hooks to all repos..."
 HOME=$GIT_HOME su git -s /bin/bash -c "gitolite setup --hooks-only" && \
   echo "[entrypoint] Hooks propagated." || \
   echo "[entrypoint] WARNING: setup --hooks-only failed — check LOCAL_CODE path and permissions"
 
-# ── Sync SSH principals ────────────────────────────────────────────────────
-sync_principals() {
-  HOME=$GIT_HOME su git -s /bin/bash -c \
-    'gitolite list-users 2>/dev/null' \
-    | grep -v '^@' \
-    > /etc/ssh/auth_principals/git.tmp 2>/dev/null \
-  && mv /etc/ssh/auth_principals/git.tmp /etc/ssh/auth_principals/git \
-  && chmod 644 /etc/ssh/auth_principals/git \
-  && echo "[entrypoint] Synced principals: $(cat /etc/ssh/auth_principals/git | tr '\n' ' ')"
-}
-
+# ── Ensure principals directory exists on the shared PVC ──────────────────
+# The sidecar writes /etc/ssh/auth_principals/git after every push.
+# We only need the directory to exist before sshd starts; the sidecar keeps
+# the file current from that point on.
 mkdir -p /etc/ssh/auth_principals
-sync_principals || echo "[entrypoint] WARNING: Could not sync principals"
-
-(while true; do sleep 30; sync_principals 2>/dev/null || true; done) &
+chmod 755 /etc/ssh/auth_principals
+# Seed an empty file so sshd doesn't error on first boot before the sidecar
+# has had a chance to write the real contents.
+touch /etc/ssh/auth_principals/git
+chmod 644 /etc/ssh/auth_principals/git
+echo "[entrypoint] principals directory ready (sidecar will populate after first push)"
 
 echo "[entrypoint] Starting sshd..."
 exec /usr/sbin/sshd -D -e

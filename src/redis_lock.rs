@@ -8,7 +8,7 @@
 /// Worker loop (1 s poll):
 ///   dirty? no  → sleep
 ///   dirty? yes, debounce active? yes → sleep (still in window)
-///   dirty? yes, debounce active? no  → try lock → push → clear dirty
+///   dirty? yes, debounce active? no  → try lock → push → sync principals → clear dirty
 use std::time::Duration;
 
 use anyhow::Result;
@@ -21,6 +21,10 @@ const PENDING_KEY: &str  = "gitolite:pending_push";
 const DIRTY_KEY: &str    = "gitolite:dirty";
 const LOCK_KEY: &str     = "gitolite:push_lock";
 const LOCK_TTL_MS: u64   = 60_000; // 60 s hard cap on a single push
+
+/// Path on the shared PVC where the gitolite SSH server reads principals from.
+/// Must match the sshd_config `AuthorizedPrincipalsFile` directive.
+const PRINCIPALS_FILE: &str = "/etc/ssh/auth_principals/git";
 
 // ── Write-side helpers (called from handlers) ────────────────────────────────
 
@@ -84,6 +88,76 @@ pub async fn release_push_lock(redis: &mut redis::aio::ConnectionManager) -> Res
 pub async fn clear_dirty(redis: &mut redis::aio::ConnectionManager) -> Result<()> {
     redis.del::<_, ()>(DIRTY_KEY).await?;
     debug!("[redis] dirty flag CLEARED");
+    Ok(())
+}
+
+// ── Principals sync ───────────────────────────────────────────────────────────
+
+/// Collect every username from `permissions/*/users` files in the admin repo
+/// and write them as a newline-delimited list to `PRINCIPALS_FILE`.
+///
+/// The gitolite SSH server reads this file to decide which certificate
+/// principals are allowed to authenticate. Called after every successful push
+/// so the file always reflects the current workspace membership.
+pub async fn sync_principals(repo_root: &std::path::Path) -> Result<()> {
+    let perms_dir = repo_root.join("permissions");
+
+    let mut users: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+
+    // Walk permissions/<workspace>/users files
+    match tokio::fs::read_dir(&perms_dir).await {
+        Ok(mut rd) => {
+            while let Some(entry) = rd.next_entry().await? {
+                if !entry.file_type().await?.is_dir() {
+                    continue;
+                }
+                let users_file = entry.path().join("users");
+                match tokio::fs::read_to_string(&users_file).await {
+                    Ok(content) => {
+                        for line in content.lines() {
+                            let name = line.trim();
+                            if !name.is_empty() {
+                                users.insert(name.to_string());
+                            }
+                        }
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => {
+                        warn!(
+                            "[principals] failed to read {}: {e:#}",
+                            users_file.display()
+                        );
+                    }
+                }
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            // permissions/ dir doesn't exist yet — write an empty file
+        }
+        Err(e) => return Err(e.into()),
+    }
+
+    // Ensure parent directory exists (shared PVC must be mounted)
+    if let Some(parent) = std::path::Path::new(PRINCIPALS_FILE).parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+
+    let content = if users.is_empty() {
+        String::new()
+    } else {
+        let mut s = users.iter().cloned().collect::<Vec<_>>().join("\n");
+        s.push('\n');
+        s
+    };
+
+    tokio::fs::write(PRINCIPALS_FILE, &content).await?;
+
+    info!(
+        "[principals] wrote {} principal(s) to {PRINCIPALS_FILE}: {}",
+        users.len(),
+        users.iter().cloned().collect::<Vec<_>>().join(", ")
+    );
+
     Ok(())
 }
 
@@ -154,10 +228,11 @@ pub fn spawn_push_worker(state: AppState) {
 
             // ── 4. Push ──────────────────────────────────────────────────────
             info!("[git] acquiring repo mutex …");
-            {
+            let repo_root = {
                 let repo = state.0.admin_repo.lock().await;
-                info!("[git] pushing gitolite-admin to remote …");
+                let root = repo.repo_path.clone();
 
+                info!("[git] pushing gitolite-admin to remote …");
                 match repo.commit_and_push("chore: sidecar auto-push").await {
                     Ok(_) => {
                         info!("[git] ✓ push succeeded");
@@ -169,9 +244,16 @@ pub fn spawn_push_worker(state: AppState) {
                         continue;
                     }
                 }
-            } // repo mutex released here
 
-            // ── 5. Clean up Redis state ──────────────────────────────────────
+                root
+            }; // repo mutex released here
+
+            // ── 5. Sync principals to shared PVC ─────────────────────────────
+            if let Err(e) = sync_principals(&repo_root).await {
+                warn!("[principals] sync failed (non-fatal): {e:#}");
+            }
+
+            // ── 6. Clean up Redis state ──────────────────────────────────────
             if let Err(e) = clear_dirty(&mut redis).await {
                 warn!("[redis] failed to clear dirty flag: {e}");
             }
