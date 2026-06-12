@@ -102,22 +102,23 @@ pub async fn clear_dirty(redis: &mut redis::aio::ConnectionManager) -> Result<()
 pub async fn sync_principals(repo_root: &std::path::Path) -> Result<()> {
     let perms_dir = repo_root.join("permissions");
 
-    let mut users: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut principals: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
 
-    // Walk permissions/<workspace>/users files
     match tokio::fs::read_dir(&perms_dir).await {
         Ok(mut rd) => {
             while let Some(entry) = rd.next_entry().await? {
                 if !entry.file_type().await?.is_dir() {
                     continue;
                 }
+
+                // Collect individual usernames
                 let users_file = entry.path().join("users");
                 match tokio::fs::read_to_string(&users_file).await {
                     Ok(content) => {
                         for line in content.lines() {
                             let name = line.trim();
                             if !name.is_empty() {
-                                users.insert(name.to_string());
+                                principals.insert(name.to_string());
                             }
                         }
                     }
@@ -129,23 +130,40 @@ pub async fn sync_principals(repo_root: &std::path::Path) -> Result<()> {
                         );
                     }
                 }
+
+                // Collect group IDs
+                let groups_file = entry.path().join("groups");
+                match tokio::fs::read_to_string(&groups_file).await {
+                    Ok(content) => {
+                        for line in content.lines() {
+                            let name = line.trim();
+                            if !name.is_empty() {
+                                principals.insert(name.to_string());
+                            }
+                        }
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => {
+                        warn!(
+                            "[principals] failed to read {}: {e:#}",
+                            groups_file.display()
+                        );
+                    }
+                }
             }
         }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            // permissions/ dir doesn't exist yet — write an empty file
-        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => return Err(e.into()),
     }
 
-    // Ensure parent directory exists (shared PVC must be mounted)
     if let Some(parent) = std::path::Path::new(PRINCIPALS_FILE).parent() {
         tokio::fs::create_dir_all(parent).await?;
     }
 
-    let content = if users.is_empty() {
+    let content = if principals.is_empty() {
         String::new()
     } else {
-        let mut s = users.iter().cloned().collect::<Vec<_>>().join("\n");
+        let mut s = principals.iter().cloned().collect::<Vec<_>>().join("\n");
         s.push('\n');
         s
     };
@@ -154,8 +172,8 @@ pub async fn sync_principals(repo_root: &std::path::Path) -> Result<()> {
 
     info!(
         "[principals] wrote {} principal(s) to {PRINCIPALS_FILE}: {}",
-        users.len(),
-        users.iter().cloned().collect::<Vec<_>>().join(", ")
+        principals.len(),
+        principals.iter().cloned().collect::<Vec<_>>().join(", ")
     );
 
     Ok(())
