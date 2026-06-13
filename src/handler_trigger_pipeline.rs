@@ -4,7 +4,6 @@
 
 use std::convert::Infallible;
 use std::path::PathBuf;
-use std::process::Command;
 
 use tracing::{error, info, warn};
 use warp::http::StatusCode;

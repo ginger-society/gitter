@@ -74,9 +74,16 @@ pub fn transform_pipeline(
 }
 
 /// Build a complete PipelineRun YAML for a triggered pipeline.
-/// The PipelineRun is constructed as a raw string (not via serde_yaml) because
-/// it uses generateName which serde_yaml would reorder unpredictably, and
-/// because the workspace volumeClaimTemplate blocks are static and verbose.
+///
+/// System params (gl_user, gl_repo, etc.) are single-quoted — they are simple
+/// alphanumeric/path strings that never contain single quotes.
+///
+/// User-supplied params (vault, values, arbitrary JSON, etc.) are serialized as
+/// YAML literal block scalars (`|`). This means ANY content — JSON with `{:}'"`
+/// characters, shell expressions with `$`, multi-line strings — is treated as a
+/// plain string by the YAML parser with zero escaping required. The block scalar
+/// appends a trailing newline, which callers should handle (e.g. `printf '%s'`
+/// rather than `echo`, or `| tr -d '\n'` when writing to a file).
 pub fn build_pipeline_run(
     pipeline_name: &str,
     namespace: &str,
@@ -95,6 +102,8 @@ pub fn build_pipeline_run(
     let sha_label  = &gl_new_rev[..8.min(gl_new_rev.len())];
 
     let mut params_yaml = String::new();
+
+    // System params: simple strings, safe to single-quote.
     for (k, v) in &[
         ("gl_user",    gl_user),
         ("gl_repo",    gl_repo),
@@ -102,10 +111,20 @@ pub fn build_pipeline_run(
         ("gl_new_rev", gl_new_rev),
         ("image_tag",  image_tag),
     ] {
-        params_yaml.push_str(&format!("    - name: {}\n      value: \"{}\"\n", k, v));
+        params_yaml.push_str(&format!("    - name: {}\n      value: '{}'\n", k, v));
     }
+
+    // User params: may contain JSON, shell expressions, or any special
+    // characters. Use a YAML literal block scalar (`|`) so the YAML parser
+    // never interprets the content — no escaping needed for any character.
+    // Continuation lines must be indented by 8 spaces to stay inside the
+    // block scalar (2 for list item + 6 for value indentation).
     for (k, v) in user_params {
-        params_yaml.push_str(&format!("    - name: {}\n      value: \"{}\"\n", k, v));
+        let indented = v.replace('\n', "\n        ");
+        params_yaml.push_str(&format!(
+            "    - name: {}\n      value: |\n        {}\n",
+            k, indented
+        ));
     }
 
     format!(
@@ -564,5 +583,39 @@ spec:
         assert_eq!(sanitize_label("dev-alice"), "dev-alice");
         assert_eq!(sanitize_label("-bad-"), "bad");
         assert_eq!(sanitize_label(&"a".repeat(100)), "a".repeat(63));
+    }
+
+    #[test]
+    fn test_build_pipeline_run_user_params_json_safe() {
+        let mut user_params = HashMap::new();
+        user_params.insert(
+            "vault".to_string(),
+            r#"{"JWT_SECRET_KEY":"1234","AWS_ACCESS_KEY_ID":"AKIAYS2NQ4JLIY3WFIVE"}"#.to_string(),
+        );
+        user_params.insert(
+            "values".to_string(),
+            r#"{"HOSTING_FQDN":"$HOSTING_FQDN","shared":{"DATABASE_PASSWORD":"shell(kubectl get secret pg-postgresql -o jsonpath='{.data.postgres-password}' | base64 -d)"}}"#.to_string(),
+        );
+
+        let yaml = build_pipeline_run(
+            "debug-pipeline",
+            "tasks-ginger-society-iac",
+            &user_params,
+            "alice",
+            "ginger-society/ginger-society-iac",
+            "refs/heads/main",
+            "abc12345def67890",
+        );
+
+        // Must parse as valid YAML without error
+        let parsed: serde_yaml::Value = serde_yaml::from_str(&yaml)
+            .expect("build_pipeline_run produced invalid YAML");
+
+        // Find vault param and verify value round-trips correctly
+        let params = parsed["spec"]["params"].as_sequence().unwrap();
+        let vault_param = params.iter().find(|p| p["name"].as_str() == Some("vault")).unwrap();
+        let vault_val = vault_param["value"].as_str().unwrap().trim();
+        assert!(vault_val.contains("JWT_SECRET_KEY"), "vault value not preserved: {}", vault_val);
+        assert!(vault_val.contains("AKIAYS2NQ4JLIY3WFIVE"), "vault value not preserved: {}", vault_val);
     }
 }
