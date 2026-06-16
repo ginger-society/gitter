@@ -649,7 +649,7 @@ pub async fn handle_file_raw(
     tail: warp::path::Tail,
     state: AppState,
 ) -> Result<impl warp::Reply, Infallible> {
-    let file_path = tail.as_str().to_string();
+    let file_path = tail.as_str().trim_start_matches('/').to_string();
 
     // ── Basic validation ──────────────────────────────────────────────────────
     if repo_name.trim().is_empty() {
