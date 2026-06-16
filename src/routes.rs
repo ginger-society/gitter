@@ -48,11 +48,12 @@ use crate::requests::{
     UpdateTektonKubeconfigRequest,
 };
 use crate::repo_handler::{
-    __path_handle_file_content, __path_handle_org_commits, __path_handle_org_diff,
-    __path_handle_squash, BranchCommit, DiffLine, DiffStatus, FileContentRequest,
+    __path_handle_file_content, __path_handle_file_raw, __path_handle_org_commits,
+    __path_handle_org_diff, __path_handle_squash,
+    BranchCommit, DiffLine, DiffStatus, FileContentRequest,
     FileContentResponse, FileDiff, HighlightedLine, OrgBranchCommitsResponse, OrgCommitsRequest,
     OrgDiffRequest, OrgDiffResponse, RepoBranchCommits, RepoDiff, handle_file_content,
-    handle_org_commits, handle_org_diff, handle_squash,
+    handle_file_raw, handle_org_commits, handle_org_diff, handle_squash,
 };
 use crate::state::AppState;
 
@@ -70,6 +71,7 @@ use crate::state::AppState;
         handle_create_db_taskrun,
         handle_db_taskrun_logs,
         handle_file_content,
+        handle_file_raw,
         handle_org_diff,
         handle_org_commits,
         handle_squash,
@@ -236,6 +238,17 @@ pub fn build(
         .and(with_state(state.clone()))
         .and_then(handle_file_content);
 
+    // GET /repo/file/raw/:repo/:ref/*path
+    let file_raw = warp::get()
+        .and(warp::path("repo"))
+        .and(warp::path("file"))
+        .and(warp::path("raw"))
+        .and(warp::path::param::<String>()) // :repo
+        .and(warp::path::param::<String>()) // :ref
+        .and(warp::path::tail())            // *path (may contain slashes)
+        .and(with_state(state.clone()))
+        .and_then(handle_file_raw);
+
     // POST /org/diff
     let org_diff = warp::post()
         .and(warp::path("org"))
@@ -351,6 +364,7 @@ pub fn build(
         .or(create_db_taskrun)
         .or(db_taskrun_logs)
         .or(file_content)
+        .or(file_raw)
         .or(org_diff)
         .or(org_commits)
         .or(squash)

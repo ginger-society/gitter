@@ -17,7 +17,6 @@ const REPOS_ROOT: &str = "/home/git/repositories";
 const FILE_CACHE_TTL: u64 = 10; // seconds
 
 // ── Request / Response types ──────────────────────────────────────────────────
-// ── Updated request ───────────────────────────────────────────────────────────
 
 #[derive(Debug, serde::Deserialize, utoipa::ToSchema)]
 pub struct FileContentRequest {
@@ -40,14 +39,13 @@ pub struct HighlightedLine {
     pub highlighted_dark: String,
 }
 
-// ── Updated response ──────────────────────────────────────────────────────────
+// ── Updated response (content removed — use GET /repo/file/raw/... instead) ──
 
 #[derive(Debug, serde::Serialize, utoipa::ToSchema)]
 pub struct FileContentResponse {
     pub repo: String,
     pub r#ref: String,
     pub path: String,
-    pub content: String,
     pub cached: bool,
     /// Populated only when the request had `highlight: true`.
     pub lines: Option<Vec<HighlightedLine>>,
@@ -316,7 +314,6 @@ fn diff_repo(repo: &Repository, repo_name: &str, branch: &str, highlighter: &cra
 
                     let ext = resolve_extension(&current_path);
 
-
                     let trimmed = content.trim_end_matches('\n');
                     let (highlighted_light, highlighted_dark) =
                         highlighter.highlight_line(trimmed, ext);
@@ -494,7 +491,7 @@ fn detect_conflicts(
     tag = "default",
     request_body(content = FileContentRequest, content_type = "application/json"),
     responses(
-        (status = 200, description = "File content",       body = FileContentResponse),
+        (status = 200, description = "File metadata and optional highlighted lines", body = FileContentResponse),
         (status = 400, description = "Validation error",   body = GenericResponse),
         (status = 404, description = "Repo/file not found",body = GenericResponse),
         (status = 500, description = "Internal error",     body = GenericResponse),
@@ -541,14 +538,15 @@ pub async fn handle_file_content(
     let mut redis = state.0.redis.clone();
 
     match redis.get::<_, Option<String>>(&key).await {
-        Ok(Some(cached)) => {
+        Ok(Some(_cached)) => {
             info!("[cache] HIT {key}");
+            // Content is intentionally omitted from the JSON response.
+            // Use GET /repo/file/raw/{repo}/{ref}/{path..} to fetch raw content.
             return Ok(warp::reply::with_status(
                 warp::reply::json(&FileContentResponse {
                     repo: body.repo,
                     r#ref: git_ref,
                     path: body.path,
-                    content: cached,
                     cached: true,
                     lines: None,
                 }),
@@ -606,17 +604,100 @@ pub async fn handle_file_content(
         None
     };
 
+    // Content is intentionally omitted from the JSON response.
+    // Use GET /repo/file/raw/{repo}/{ref}/{path..} to fetch raw content.
     Ok(warp::reply::with_status(
         warp::reply::json(&FileContentResponse {
             repo: body.repo,
             r#ref: git_ref,
             path: body.path,
-            content,
             cached: false,
             lines,
         }),
         StatusCode::OK,
     ))
+}
+
+// ── Handler: GET /repo/file/raw/{repo}/{ref}/{path..} ────────────────────────
+//
+// Mirrors the githubusercontent.com pattern:
+//   GET /repo/file/raw/my-repo/main/src/main.rs
+//
+// Usable directly with curl / wget:
+//   curl http://localhost:3030/repo/file/raw/my-repo/main/src/main.rs
+//   wget http://localhost:3030/repo/file/raw/my-repo/main/src/main.rs
+
+#[utoipa::path(
+    get,
+    path = "/repo/file/raw/{repo}/{ref}/{path}",
+    tag = "default",
+    params(
+        ("repo" = String, Path, description = "Repository name (without .git)"),
+        ("ref"  = String, Path, description = "Branch name or tag"),
+        ("path" = String, Path, description = "File path within the repository (may contain slashes)"),
+    ),
+    responses(
+        (status = 200, description = "Raw file bytes",          content_type = "text/plain; charset=utf-8"),
+        (status = 400, description = "Validation error",        body = GenericResponse),
+        (status = 404, description = "Repo or file not found",  body = GenericResponse),
+        (status = 500, description = "Internal error",          body = GenericResponse),
+    )
+)]
+pub async fn handle_file_raw(
+    repo_name: String,
+    git_ref: String,
+    tail: warp::path::Tail,
+    state: AppState,
+) -> Result<impl warp::Reply, Infallible> {
+    let file_path = tail.as_str().to_string();
+
+    // ── Basic validation ──────────────────────────────────────────────────────
+    if repo_name.trim().is_empty() {
+        return Ok(raw_error(StatusCode::BAD_REQUEST, "'repo' must not be empty"));
+    }
+    if git_ref.trim().is_empty() {
+        return Ok(raw_error(StatusCode::BAD_REQUEST, "'ref' must not be empty"));
+    }
+    if file_path.trim().is_empty() {
+        return Ok(raw_error(StatusCode::BAD_REQUEST, "'path' must not be empty"));
+    }
+
+    info!("GET /repo/file/raw/{repo_name}/{git_ref}/{file_path}");
+
+    // ── Cache lookup ──────────────────────────────────────────────────────────
+    let key = cache_key(&repo_name, &git_ref, &file_path);
+    let mut redis = state.0.redis.clone();
+
+    match redis.get::<_, Option<String>>(&key).await {
+        Ok(Some(cached)) => {
+            info!("[cache] HIT {key}");
+            return Ok(raw_ok(cached));
+        }
+        Ok(None)  => info!("[cache] MISS {key}"),
+        Err(e)    => warn!("[cache] redis error (continuing without cache): {e:#}"),
+    }
+
+    // ── Read from bare repo ───────────────────────────────────────────────────
+    let repo = match open_repo(&repo_name) {
+        Ok(r)  => r,
+        Err(e) => return Ok(raw_error(StatusCode::NOT_FOUND, e.to_string())),
+    };
+
+    let content = match read_file_from_repo(&repo, &git_ref, &file_path) {
+        Ok(c)  => c,
+        Err(e) => {
+            let msg = e.to_string();
+            error!("[git] read_file failed: {msg}");
+            return Ok(raw_error(StatusCode::NOT_FOUND, msg));
+        }
+    };
+
+    // ── Populate cache ────────────────────────────────────────────────────────
+    if let Err(e) = redis.set_ex::<_, _, ()>(&key, &content, FILE_CACHE_TTL).await {
+        warn!("[cache] failed to write {key}: {e:#}");
+    }
+
+    Ok(raw_ok(content))
 }
 
 // ── Handler: POST /org/diff ───────────────────────────────────────────────────
@@ -658,7 +739,6 @@ pub async fn handle_org_diff(
     let mut handles = Vec::with_capacity(repo_names.len());
     for repo_name in repo_names {
         let branch = body.branch.clone();
-        // Clone the Arc so the blocking task owns it
         let state = state.clone();
         handles.push(tokio::task::spawn_blocking(move || {
             let repo = match open_repo(&repo_name) {
@@ -763,6 +843,7 @@ pub async fn handle_org_commits(
 // ── Small reply helpers ───────────────────────────────────────────────────────
 
 type JsonReply = warp::reply::WithStatus<warp::reply::Json>;
+type RawReply  = warp::reply::WithStatus<warp::reply::WithHeader<String>>;
 
 fn bad_request(msg: impl Into<String>) -> JsonReply {
     warp::reply::with_status(
@@ -782,6 +863,22 @@ fn internal_error(msg: impl Into<String>) -> JsonReply {
     warp::reply::with_status(
         warp::reply::json(&GenericResponse { status: "error", message: Some(msg.into()) }),
         StatusCode::INTERNAL_SERVER_ERROR,
+    )
+}
+
+/// Return raw file content as plain text.
+fn raw_ok(content: String) -> RawReply {
+    warp::reply::with_status(
+        warp::reply::with_header(content, "Content-Type", "text/plain; charset=utf-8"),
+        StatusCode::OK,
+    )
+}
+
+/// Return a plain-text error for the raw endpoint (no JSON wrapper).
+fn raw_error(status: StatusCode, msg: impl Into<String>) -> RawReply {
+    warp::reply::with_status(
+        warp::reply::with_header(msg.into(), "Content-Type", "text/plain; charset=utf-8"),
+        status,
     )
 }
 
@@ -845,8 +942,6 @@ fn squash_branch(
     }
 
     // ── Build the squashed tree ───────────────────────────────────────────────
-    // The tree we want is exactly the branch tip's tree — squashing only
-    // collapses history, it does not change the working-tree state.
     let branch_commit = repo.find_commit(branch_oid)?;
     let squashed_tree = branch_commit.tree()?;
 
@@ -859,29 +954,25 @@ fn squash_branch(
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs() as i64,
-        0, // UTC offset in minutes
+        0,
     );
     let author    = git2::Signature::new(author_name, author_email, &now)?;
-    let committer = author.clone(); // keep it simple; caller can extend later
+    let committer = author.clone();
 
     // ── Parent: the merge-base commit ─────────────────────────────────────────
-    // Squashing onto the merge-base means the new commit's parent is the last
-    // commit that is shared with main, which is exactly what `git rebase -i`
-    // does when you squash everything down to one.
     let base_commit = repo.find_commit(base_oid)?;
 
     // ── Write the new commit ──────────────────────────────────────────────────
     let new_oid = repo.commit(
-        None,                // don't update any ref yet — we'll do it atomically below
+        None,
         &author,
         &committer,
         message,
         &squashed_tree,
-        &[&base_commit],     // single parent = the merge-base
+        &[&base_commit],
     )?;
 
     // ── Force-update the branch ref ───────────────────────────────────────────
-    // This is the equivalent of `git update-ref -f refs/heads/<branch> <new_oid>`.
     let reflog_msg = format!(
         "squash: collapsed {commits_squashed} commit(s) into one on branch '{branch}'"
     );
@@ -958,9 +1049,6 @@ pub async fn handle_squash(
         Ok(Err(e)) => {
             let msg = e.to_string();
             error!("[squash] failed: {msg}");
-            // Distinguish "not found" from general errors by message content —
-            // a tighter approach would be a custom error enum, but this keeps
-            // the diff small and consistent with the rest of the file.
             if msg.contains("not found") {
                 Ok(not_found(msg))
             } else {
