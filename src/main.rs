@@ -19,6 +19,7 @@ mod merge_consumer;
 mod pipeline_hook;
 mod handler_trigger_pipeline;
 mod handle_run_pipeline;
+mod handler_pair_programming;
 
 use std::sync::Arc;
 

@@ -29,7 +29,7 @@ use uuid::Uuid;
 use warp::http::StatusCode;
 
 use crate::rabbit::{publish_merge_request, RabbitPoolRef};
-use crate::requests::ApiResponse;
+use crate::requests::GenericResponse;
 use crate::state::AppState;
 
 // ── Redis key constants ───────────────────────────────────────────────────────
@@ -78,9 +78,9 @@ pub struct MergeQueueConflict {
     request_body(content = MergeQueueRequest, content_type = "application/json"),
     responses(
         (status = 200, description = "Request enqueued",                          body = MergeQueueResponse),
-        (status = 400, description = "Validation error",                          body = ApiResponse),
+        (status = 400, description = "Validation error",                          body = GenericResponse),
         (status = 409, description = "Server locked by another merge request",    body = MergeQueueConflict),
-        (status = 500, description = "Internal error",                            body = ApiResponse),
+        (status = 500, description = "Internal error",                            body = GenericResponse),
     )
 )]
 pub async fn handle_merge_queue(
@@ -206,7 +206,7 @@ impl<R: warp::Reply> IntoResponse for warp::reply::WithStatus<R> {
 
 fn bad_request(msg: impl Into<String>) -> warp::reply::Response {
     warp::reply::with_status(
-        warp::reply::json(&ApiResponse {
+        warp::reply::json(&GenericResponse {
             status: "error",
             message: Some(msg.into()),
         }),

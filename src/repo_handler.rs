@@ -8,7 +8,7 @@ use redis::AsyncCommands;
 use tracing::{error, info, warn};
 use warp::http::StatusCode;
 
-use crate::requests::{ApiResponse, SquashRequest, SquashResponse};
+use crate::requests::{GenericResponse, SquashRequest, SquashResponse};
 use crate::state::AppState;
 
 // ── Constants ─────────────────────────────────────────────────────────────────
@@ -495,9 +495,9 @@ fn detect_conflicts(
     request_body(content = FileContentRequest, content_type = "application/json"),
     responses(
         (status = 200, description = "File content",       body = FileContentResponse),
-        (status = 400, description = "Validation error",   body = ApiResponse),
-        (status = 404, description = "Repo/file not found",body = ApiResponse),
-        (status = 500, description = "Internal error",     body = ApiResponse),
+        (status = 400, description = "Validation error",   body = GenericResponse),
+        (status = 404, description = "Repo/file not found",body = GenericResponse),
+        (status = 500, description = "Internal error",     body = GenericResponse),
     )
 )]
 pub async fn handle_file_content(
@@ -509,7 +509,7 @@ pub async fn handle_file_content(
         (None,  Some(t)) => t.clone(),
         (Some(_), Some(_)) => {
             return Ok(warp::reply::with_status(
-                warp::reply::json(&ApiResponse {
+                warp::reply::json(&GenericResponse {
                     status: "error",
                     message: Some("provide either 'branch' or 'tag', not both".into()),
                 }),
@@ -518,7 +518,7 @@ pub async fn handle_file_content(
         }
         (None, None) => {
             return Ok(warp::reply::with_status(
-                warp::reply::json(&ApiResponse {
+                warp::reply::json(&GenericResponse {
                     status: "error",
                     message: Some("one of 'branch' or 'tag' is required".into()),
                 }),
@@ -628,8 +628,8 @@ pub async fn handle_file_content(
     request_body(content = OrgDiffRequest, content_type = "application/json"),
     responses(
         (status = 200, description = "Org-wide diff result", body = OrgDiffResponse),
-        (status = 400, description = "Validation error",     body = ApiResponse),
-        (status = 500, description = "Internal error",       body = ApiResponse),
+        (status = 400, description = "Validation error",     body = GenericResponse),
+        (status = 500, description = "Internal error",       body = GenericResponse),
     )
 )]
 pub async fn handle_org_diff(
@@ -704,8 +704,8 @@ pub async fn handle_org_diff(
     request_body(content = OrgCommitsRequest, content_type = "application/json"),
     responses(
         (status = 200, description = "Commits per repo since branch point", body = OrgBranchCommitsResponse),
-        (status = 400, description = "Validation error",                    body = ApiResponse),
-        (status = 500, description = "Internal error",                      body = ApiResponse),
+        (status = 400, description = "Validation error",                    body = GenericResponse),
+        (status = 500, description = "Internal error",                      body = GenericResponse),
     )
 )]
 pub async fn handle_org_commits(
@@ -766,21 +766,21 @@ type JsonReply = warp::reply::WithStatus<warp::reply::Json>;
 
 fn bad_request(msg: impl Into<String>) -> JsonReply {
     warp::reply::with_status(
-        warp::reply::json(&ApiResponse { status: "error", message: Some(msg.into()) }),
+        warp::reply::json(&GenericResponse { status: "error", message: Some(msg.into()) }),
         StatusCode::BAD_REQUEST,
     )
 }
 
 fn not_found(msg: impl Into<String>) -> JsonReply {
     warp::reply::with_status(
-        warp::reply::json(&ApiResponse { status: "error", message: Some(msg.into()) }),
+        warp::reply::json(&GenericResponse { status: "error", message: Some(msg.into()) }),
         StatusCode::NOT_FOUND,
     )
 }
 
 fn internal_error(msg: impl Into<String>) -> JsonReply {
     warp::reply::with_status(
-        warp::reply::json(&ApiResponse { status: "error", message: Some(msg.into()) }),
+        warp::reply::json(&GenericResponse { status: "error", message: Some(msg.into()) }),
         StatusCode::INTERNAL_SERVER_ERROR,
     )
 }
@@ -908,9 +908,9 @@ fn squash_branch(
     request_body(content = SquashRequest, content_type = "application/json"),
     responses(
         (status = 200, description = "Squash succeeded",    body = SquashResponse),
-        (status = 400, description = "Validation error",    body = ApiResponse),
-        (status = 404, description = "Repo/branch not found", body = ApiResponse),
-        (status = 500, description = "Internal error",      body = ApiResponse),
+        (status = 400, description = "Validation error",    body = GenericResponse),
+        (status = 404, description = "Repo/branch not found", body = GenericResponse),
+        (status = 500, description = "Internal error",      body = GenericResponse),
     )
 )]
 pub async fn handle_squash(

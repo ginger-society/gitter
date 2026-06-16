@@ -8,7 +8,7 @@ use warp::http::StatusCode;
 use crate::permissions::{self, MemberType};
 use crate::redis_lock::{mark_dirty, signal_pending};
 use crate::requests::{
-    AddMemberRequest, ApiResponse, KubeconfigRequest, MemberTypeDto, RemoveMemberRequest,
+    AddMemberRequest, GenericResponse, KubeconfigRequest, MemberTypeDto, RemoveMemberRequest,
     UpdatePipelineTokenRequest, UpdateTektonKubeconfigRequest,
 };
 use crate::state::AppState;
@@ -46,11 +46,11 @@ async fn schedule_push(state: &AppState) {
     ),
     request_body(content = AddMemberRequest, content_type = "application/json"),
     responses(
-        (status = 200, description = "Member already present", body = ApiResponse),
-        (status = 201, description = "Member added", body = ApiResponse),
-        (status = 400, description = "Validation error", body = ApiResponse),
-        (status = 401, description = "Unauthorized", body = ApiResponse),
-        (status = 500, description = "Internal error", body = ApiResponse),
+        (status = 200, description = "Member already present", body = GenericResponse),
+        (status = 201, description = "Member added", body = GenericResponse),
+        (status = 400, description = "Validation error", body = GenericResponse),
+        (status = 401, description = "Unauthorized", body = GenericResponse),
+        (status = 500, description = "Internal error", body = GenericResponse),
     )
 )]
 pub async fn handle_add_member(
@@ -66,7 +66,7 @@ pub async fn handle_add_member(
 
     if workspace.trim().is_empty() {
         return Ok(warp::reply::with_status(
-            warp::reply::json(&ApiResponse {
+            warp::reply::json(&GenericResponse {
                 status: "error",
                 message: Some("workspace must not be empty".into()),
             }),
@@ -75,7 +75,7 @@ pub async fn handle_add_member(
     }
     if body.name.trim().is_empty() {
         return Ok(warp::reply::with_status(
-            warp::reply::json(&ApiResponse {
+            warp::reply::json(&GenericResponse {
                 status: "error",
                 message: Some("name must not be empty".into()),
             }),
@@ -93,7 +93,7 @@ pub async fn handle_add_member(
         Err(e) => {
             error!("[permissions] add_member failed: {e:#}");
             return Ok(warp::reply::with_status(
-                warp::reply::json(&ApiResponse {
+                warp::reply::json(&GenericResponse {
                     status: "error",
                     message: Some(e.to_string()),
                 }),
@@ -105,7 +105,7 @@ pub async fn handle_add_member(
     if let Err(e) = permissions::regenerate_conf(&repo_root).await {
         error!("[permissions] regenerate_conf failed: {e:#}");
         return Ok(warp::reply::with_status(
-            warp::reply::json(&ApiResponse {
+            warp::reply::json(&GenericResponse {
                 status: "error",
                 message: Some(e.to_string()),
             }),
@@ -117,7 +117,7 @@ pub async fn handle_add_member(
 
     if added {
         Ok(warp::reply::with_status(
-            warp::reply::json(&ApiResponse {
+            warp::reply::json(&GenericResponse {
                 status: "ok",
                 message: Some(format!(
                     "added {} '{}' to workspace '{workspace}'",
@@ -128,7 +128,7 @@ pub async fn handle_add_member(
         ))
     } else {
         Ok(warp::reply::with_status(
-            warp::reply::json(&ApiResponse {
+            warp::reply::json(&GenericResponse {
                 status: "ok",
                 message: Some(format!(
                     "{} '{}' already in workspace '{workspace}' — no change",
@@ -150,10 +150,10 @@ pub async fn handle_add_member(
     params(("workspace" = String, Path, description = "Workspace name")),
     request_body(content = RemoveMemberRequest, content_type = "application/json"),
     responses(
-        (status = 200, description = "Member removed or was not present", body = ApiResponse),
-        (status = 400, description = "Validation error", body = ApiResponse),
-        (status = 401, description = "Unauthorized", body = ApiResponse),
-        (status = 500, description = "Internal error", body = ApiResponse),
+        (status = 200, description = "Member removed or was not present", body = GenericResponse),
+        (status = 400, description = "Validation error", body = GenericResponse),
+        (status = 401, description = "Unauthorized", body = GenericResponse),
+        (status = 500, description = "Internal error", body = GenericResponse),
     )
 )]
 pub async fn handle_remove_member(
@@ -169,7 +169,7 @@ pub async fn handle_remove_member(
 
     if workspace.trim().is_empty() {
         return Ok(warp::reply::with_status(
-            warp::reply::json(&ApiResponse {
+            warp::reply::json(&GenericResponse {
                 status: "error",
                 message: Some("workspace must not be empty".into()),
             }),
@@ -178,7 +178,7 @@ pub async fn handle_remove_member(
     }
     if body.name.trim().is_empty() {
         return Ok(warp::reply::with_status(
-            warp::reply::json(&ApiResponse {
+            warp::reply::json(&GenericResponse {
                 status: "error",
                 message: Some("name must not be empty".into()),
             }),
@@ -196,7 +196,7 @@ pub async fn handle_remove_member(
         Err(e) => {
             error!("[permissions] remove_member failed: {e:#}");
             return Ok(warp::reply::with_status(
-                warp::reply::json(&ApiResponse {
+                warp::reply::json(&GenericResponse {
                     status: "error",
                     message: Some(e.to_string()),
                 }),
@@ -209,7 +209,7 @@ pub async fn handle_remove_member(
         if let Err(e) = permissions::regenerate_conf(&repo_root).await {
             error!("[permissions] regenerate_conf failed: {e:#}");
             return Ok(warp::reply::with_status(
-                warp::reply::json(&ApiResponse {
+                warp::reply::json(&GenericResponse {
                     status: "error",
                     message: Some(e.to_string()),
                 }),
@@ -226,7 +226,7 @@ pub async fn handle_remove_member(
     };
 
     Ok(warp::reply::with_status(
-        warp::reply::json(&ApiResponse { status: "ok", message: Some(msg) }),
+        warp::reply::json(&GenericResponse { status: "ok", message: Some(msg) }),
         StatusCode::OK,
     ))
 }
@@ -240,10 +240,10 @@ pub async fn handle_remove_member(
     security(("apiBearerAuth" = [])),
     request_body(content = KubeconfigRequest, content_type = "application/json"),
     responses(
-        (status = 202, description = "Queued for push", body = ApiResponse),
-        (status = 400, description = "Validation error", body = ApiResponse),
-        (status = 401, description = "Unauthorized", body = ApiResponse),
-        (status = 500, description = "Internal error", body = ApiResponse),
+        (status = 202, description = "Queued for push", body = GenericResponse),
+        (status = 400, description = "Validation error", body = GenericResponse),
+        (status = 401, description = "Unauthorized", body = GenericResponse),
+        (status = 500, description = "Internal error", body = GenericResponse),
     )
 )]
 pub async fn handle_kubeconfig(
@@ -258,7 +258,7 @@ pub async fn handle_kubeconfig(
 
     if body.workspace.trim().is_empty() {
         return Ok(warp::reply::with_status(
-            warp::reply::json(&ApiResponse {
+            warp::reply::json(&GenericResponse {
                 status: "error",
                 message: Some("workspace must not be empty".into()),
             }),
@@ -267,7 +267,7 @@ pub async fn handle_kubeconfig(
     }
     if body.environment.trim().is_empty() {
         return Ok(warp::reply::with_status(
-            warp::reply::json(&ApiResponse {
+            warp::reply::json(&GenericResponse {
                 status: "error",
                 message: Some("environment must not be empty".into()),
             }),
@@ -279,7 +279,7 @@ pub async fn handle_kubeconfig(
     if let Err(e) = repo.write_kubeconfig(&body.workspace, &body.environment, &body.kubeconfig).await {
         error!("[git] write_kubeconfig failed: {e:#}");
         return Ok(warp::reply::with_status(
-            warp::reply::json(&ApiResponse {
+            warp::reply::json(&GenericResponse {
                 status: "error",
                 message: Some(e.to_string()),
             }),
@@ -291,7 +291,7 @@ pub async fn handle_kubeconfig(
     schedule_push(&state).await;
 
     Ok(warp::reply::with_status(
-        warp::reply::json(&ApiResponse {
+        warp::reply::json(&GenericResponse {
             status: "accepted",
             message: Some(format!(
                 "kubeconfig for workspace '{}' env '{}' queued for push",
@@ -309,12 +309,12 @@ pub async fn handle_kubeconfig(
     path = "/healthz",
     tag = "default",
     responses(
-        (status = 200, description = "Service is healthy", body = ApiResponse),
+        (status = 200, description = "Service is healthy", body = GenericResponse),
     )
 )]
 pub async fn handle_health() -> Result<impl warp::Reply, Infallible> {
     Ok(warp::reply::with_status(
-        warp::reply::json(&ApiResponse { status: "ok", message: None }),
+        warp::reply::json(&GenericResponse { status: "ok", message: None }),
         StatusCode::OK,
     ))
 }
@@ -328,10 +328,10 @@ pub async fn handle_health() -> Result<impl warp::Reply, Infallible> {
     security(("apiBearerAuth" = [])),
     request_body(content = UpdateTektonKubeconfigRequest, content_type = "application/json"),
     responses(
-        (status = 202, description = "Queued for push", body = ApiResponse),
-        (status = 400, description = "Validation error", body = ApiResponse),
-        (status = 401, description = "Unauthorized", body = ApiResponse),
-        (status = 500, description = "Internal error", body = ApiResponse),
+        (status = 202, description = "Queued for push", body = GenericResponse),
+        (status = 400, description = "Validation error", body = GenericResponse),
+        (status = 401, description = "Unauthorized", body = GenericResponse),
+        (status = 500, description = "Internal error", body = GenericResponse),
     )
 )]
 pub async fn handle_update_tekton_kubeconfig(
@@ -346,7 +346,7 @@ pub async fn handle_update_tekton_kubeconfig(
 
     if body.kubeconfig.trim().is_empty() {
         return Ok(warp::reply::with_status(
-            warp::reply::json(&ApiResponse {
+            warp::reply::json(&GenericResponse {
                 status: "error",
                 message: Some("kubeconfig must not be empty".into()),
             }),
@@ -358,7 +358,7 @@ pub async fn handle_update_tekton_kubeconfig(
     if let Err(e) = repo.write_tekton_kubeconfig(&body.kubeconfig).await {
         error!("[git] write_tekton_kubeconfig failed: {e:#}");
         return Ok(warp::reply::with_status(
-            warp::reply::json(&ApiResponse {
+            warp::reply::json(&GenericResponse {
                 status: "error",
                 message: Some(e.to_string()),
             }),
@@ -370,7 +370,7 @@ pub async fn handle_update_tekton_kubeconfig(
     schedule_push(&state).await;
 
     Ok(warp::reply::with_status(
-        warp::reply::json(&ApiResponse {
+        warp::reply::json(&GenericResponse {
             status: "accepted",
             message: Some("tekton kubeconfig queued for push".into()),
         }),
@@ -387,10 +387,10 @@ pub async fn handle_update_tekton_kubeconfig(
     security(("apiBearerAuth" = [])),
     request_body(content = UpdatePipelineTokenRequest, content_type = "application/json"),
     responses(
-        (status = 202, description = "Queued for push", body = ApiResponse),
-        (status = 400, description = "Validation error", body = ApiResponse),
-        (status = 401, description = "Unauthorized", body = ApiResponse),
-        (status = 500, description = "Internal error", body = ApiResponse),
+        (status = 202, description = "Queued for push", body = GenericResponse),
+        (status = 400, description = "Validation error", body = GenericResponse),
+        (status = 401, description = "Unauthorized", body = GenericResponse),
+        (status = 500, description = "Internal error", body = GenericResponse),
     )
 )]
 pub async fn handle_update_pipeline_token(
@@ -405,7 +405,7 @@ pub async fn handle_update_pipeline_token(
 
     if body.workspace.trim().is_empty() {
         return Ok(warp::reply::with_status(
-            warp::reply::json(&ApiResponse {
+            warp::reply::json(&GenericResponse {
                 status: "error",
                 message: Some("workspace must not be empty".into()),
             }),
@@ -414,7 +414,7 @@ pub async fn handle_update_pipeline_token(
     }
     if body.token.trim().is_empty() {
         return Ok(warp::reply::with_status(
-            warp::reply::json(&ApiResponse {
+            warp::reply::json(&GenericResponse {
                 status: "error",
                 message: Some("token must not be empty".into()),
             }),
@@ -426,7 +426,7 @@ pub async fn handle_update_pipeline_token(
     if let Err(e) = repo.write_pipeline_token(&body.workspace, &body.token).await {
         error!("[git] write_pipeline_token failed: {e:#}");
         return Ok(warp::reply::with_status(
-            warp::reply::json(&ApiResponse {
+            warp::reply::json(&GenericResponse {
                 status: "error",
                 message: Some(e.to_string()),
             }),
@@ -438,7 +438,7 @@ pub async fn handle_update_pipeline_token(
     schedule_push(&state).await;
 
     Ok(warp::reply::with_status(
-        warp::reply::json(&ApiResponse {
+        warp::reply::json(&GenericResponse {
             status: "accepted",
             message: Some(format!(
                 "pipeline token for workspace '{}' queued for push",

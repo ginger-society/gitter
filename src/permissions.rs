@@ -7,6 +7,11 @@
 ///       users     — newline-delimited usernames  (e.g. "vriksh")
 ///       groups    — newline-delimited group UUIDs (e.g. "435a8c5a-...")
 ///
+///   pair-programming/
+///     <workspace>/
+///       <repo>/
+///         <branch-prefix>  — newline-delimited usernames (no groups)
+///
 /// Generated gitolite.conf rules:
 ///
 ///   admin_key
@@ -19,6 +24,9 @@
 ///   groups (per workspace)
 ///     RW+    on  <workspace>-*           (full access to all branches)
 ///
+///   pair-programming slots (per workspace/repo/branch-prefix)
+///     RW+    on  refs/heads/<branch-prefix>-*  =  <name_a> <name_b> …
+///
 ///   Fixed:
 ///     repo gitolite-admin  RW+ = admin_key
 ///     repo testing         RW+ = @all
@@ -28,6 +36,8 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 use tracing::{debug, info};
+
+use crate::handler_pair_programming::load_pair_programming_slots;
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
@@ -163,12 +173,12 @@ pub async fn remove_member(
 
 // ── gitolite.conf generation ─────────────────────────────────────────────────
 
-/// Read every workspace under `permissions/` and generate the full
-/// gitolite.conf, then write it to `conf/gitolite.conf`.
+/// Read every workspace under `permissions/` and every pair-programming slot,
+/// then generate the full gitolite.conf and write it to `conf/gitolite.conf`.
 pub async fn regenerate_conf(repo_root: &Path) -> Result<()> {
     info!("[permissions] regenerating gitolite.conf …");
 
-    // Discover all workspaces by listing permissions/ subdirectories
+    // ── Discover all workspaces ───────────────────────────────────────────────
     let perms_dir = repo_root.join("permissions");
     tokio::fs::create_dir_all(&perms_dir).await?;
 
@@ -182,7 +192,22 @@ pub async fn regenerate_conf(repo_root: &Path) -> Result<()> {
         }
     }
 
-    let conf = build_conf(&workspaces);
+    // ── Collect pair-programming slots for every workspace ────────────────────
+    // Shape: workspace → repo → branch_prefix → Vec<username>
+    let mut pair_slots: BTreeMap<
+        String,
+        BTreeMap<String, BTreeMap<String, Vec<String>>>,
+    > = BTreeMap::new();
+
+    for workspace in workspaces.keys() {
+        let slots = load_pair_programming_slots(repo_root, workspace).await?;
+        if !slots.is_empty() {
+            pair_slots.insert(workspace.clone(), slots);
+        }
+    }
+
+    let conf = build_conf(&workspaces, &pair_slots);
+
     let conf_path = repo_root.join("conf/gitolite.conf");
     tokio::fs::create_dir_all(conf_path.parent().unwrap()).await?;
     tokio::fs::write(&conf_path, &conf).await?;
@@ -196,8 +221,8 @@ pub async fn regenerate_conf(repo_root: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Pure function — builds the gitolite.conf string from the workspace map.
-/// Kept separate so it is trivially unit-testable.
+/// Pure function — builds the gitolite.conf string from the workspace map and
+/// the pair-programming slot map.  Kept separate so it is trivially unit-testable.
 ///
 /// Wildcard repo creation
 /// ──────────────────────
@@ -210,7 +235,10 @@ pub async fn regenerate_conf(repo_root: &Path) -> Result<()> {
 /// individual users so they can create their own project repos under the
 /// workspace namespace.  admin_key always has C as well so the backup
 /// agent can seed repos if needed.
-fn build_conf(workspaces: &BTreeMap<String, WorkspaceMembers>) -> String {
+fn build_conf(
+    workspaces: &BTreeMap<String, WorkspaceMembers>,
+    pair_slots: &BTreeMap<String, BTreeMap<String, BTreeMap<String, Vec<String>>>>,
+) -> String {
     let mut out = String::new();
 
     // ── Fixed header ──────────────────────────────────────────────────────────
@@ -228,7 +256,7 @@ fn build_conf(workspaces: &BTreeMap<String, WorkspaceMembers>) -> String {
     // ── Per-workspace wildcard rules ──────────────────────────────────────────
     for (workspace, members) in workspaces {
         // Wildcard pattern: matches (and allows creation of) any repo whose
-        // name starts with "<workspace>-".  The `*` is what tells gitolite
+        // name starts with "<workspace>-".  The `.*` is what tells gitolite
         // this is a wildcard block — without it, gitolite treats the name
         // as a literal and will NOT auto-create the repo on first push.
         let repo_pattern = format!("{workspace}-.*");
@@ -237,9 +265,6 @@ fn build_conf(workspaces: &BTreeMap<String, WorkspaceMembers>) -> String {
         out.push_str(&format!("repo {repo_pattern}\n"));
 
         // ── Create permission ─────────────────────────────────────────────────
-        // C lets a principal create the repo by pushing to a not-yet-existing
-        // path. Without this line gitolite rejects the push with "repo not found".
-        // Requires wildrepos = 1 in gitolite.rc.
         out.push_str("    C                               =   admin_key\n");
         for group_id in &members.groups {
             out.push_str(&format!(
@@ -271,6 +296,37 @@ fn build_conf(workspaces: &BTreeMap<String, WorkspaceMembers>) -> String {
         }
 
         out.push('\n');
+
+        // ── Pair-programming slots for this workspace ─────────────────────────
+        // Each slot is a separate `repo` block for the specific repo (not a
+        // wildcard) so gitolite can match it exactly and the branch-level rule
+        // applies only to the named prefix pattern.
+        //
+        // Example output:
+        //
+        //   # pair-programming: acme/api-service
+        //   repo acme-api-service
+        //       RW+ refs/heads/TICKET-42-*  =   alice bob
+        //
+        if let Some(repo_map) = pair_slots.get(workspace) {
+            for (repo_name, prefix_map) in repo_map {
+                let full_repo = format!("{workspace}-{repo_name}");
+                out.push_str(&format!("# pair-programming: {workspace}/{repo_name}\n"));
+                out.push_str(&format!("repo {full_repo}\n"));
+
+                for (branch_prefix, names) in prefix_map {
+                    if names.is_empty() {
+                        continue;
+                    }
+                    let names_str = names.join(" ");
+                    out.push_str(&format!(
+                        "    RW+ refs/heads/{branch_prefix}-*  =   {names_str}\n"
+                    ));
+                }
+
+                out.push('\n');
+            }
+        }
     }
 
     out
@@ -291,7 +347,7 @@ mod tests {
 
     #[test]
     fn conf_contains_fixed_repos() {
-        let conf = build_conf(&BTreeMap::new());
+        let conf = build_conf(&BTreeMap::new(), &BTreeMap::new());
         assert!(conf.contains("repo gitolite-admin"));
         assert!(conf.contains("RW+     =   admin_key"));
         assert!(conf.contains("repo testing"));
@@ -300,13 +356,10 @@ mod tests {
 
     #[test]
     fn repo_pattern_is_wildcard() {
-        // The pattern MUST end with * so gitolite treats it as a wildcard
-        // block and allows on-the-fly repo creation via the C permission.
         let mut ws = BTreeMap::new();
         ws.insert("wname".into(), make_members(&[], &[]));
-        let conf = build_conf(&ws);
+        let conf = build_conf(&ws, &BTreeMap::new());
         assert!(conf.contains("repo wname-.*"));
-        // Must NOT be a character-class pattern — those don't enable C
         assert!(!conf.contains("repo wname-["));
     }
 
@@ -314,12 +367,10 @@ mod tests {
     fn admin_key_has_create_and_rw_in_workspace() {
         let mut ws = BTreeMap::new();
         ws.insert("wname".into(), make_members(&["vriksh"], &[]));
-        let conf = build_conf(&ws);
+        let conf = build_conf(&ws, &BTreeMap::new());
         let block_start = conf.find("# ── workspace: wname").unwrap();
         let block = &conf[block_start..];
-        // C permission for wildcard repo creation
         assert!(block.contains("C                               =   admin_key"));
-        // Full branch access
         assert!(block.contains("RW+                             =   admin_key"));
     }
 
@@ -327,14 +378,11 @@ mod tests {
     fn user_gets_create_dev_branch_write_and_read() {
         let mut ws = BTreeMap::new();
         ws.insert("wname".into(), make_members(&["vriksh"], &[]));
-        let conf = build_conf(&ws);
+        let conf = build_conf(&ws, &BTreeMap::new());
         let block_start = conf.find("# ── workspace: wname").unwrap();
         let block = &conf[block_start..];
-        // Users can create repos in the workspace
         assert!(block.contains("C                               =   vriksh"));
-        // Personal dev branch write
         assert!(block.contains("RW+ refs/heads/dev-vriksh-*  =   vriksh"));
-        // Read everything else
         assert!(block.contains("R                               =   vriksh"));
     }
 
@@ -343,12 +391,10 @@ mod tests {
         let uuid = "435a8c5a-da91-4b95-8364-40ca23cb1109";
         let mut ws = BTreeMap::new();
         ws.insert("wname".into(), make_members(&[], &[uuid]));
-        let conf = build_conf(&ws);
+        let conf = build_conf(&ws, &BTreeMap::new());
         let block_start = conf.find("# ── workspace: wname").unwrap();
         let block = &conf[block_start..];
-        // Groups can create repos
         assert!(block.contains(&format!("C                               =   {uuid}")));
-        // Groups have full branch access
         assert!(block.contains(&format!("RW+                             =   {uuid}")));
     }
 
@@ -362,12 +408,80 @@ mod tests {
                 &["uuid-aaa", "uuid-bbb"],
             ),
         );
-        let conf = build_conf(&ws);
+        let conf = build_conf(&ws, &BTreeMap::new());
         for user in &["alice", "bob"] {
             assert!(conf.contains(&format!("dev-{user}-*  =   {user}")));
         }
         for group in &["uuid-aaa", "uuid-bbb"] {
             assert!(conf.contains(&format!("RW+                             =   {group}")));
         }
+    }
+
+    #[test]
+    fn pair_programming_slot_emits_branch_rule() {
+        let mut ws = BTreeMap::new();
+        ws.insert("acme".into(), make_members(&[], &[]));
+
+        // pair_slots: acme → api-service → TICKET-42 → [alice, bob]
+        let mut prefix_map = BTreeMap::new();
+        prefix_map.insert(
+            "TICKET-42".to_string(),
+            vec!["alice".to_string(), "bob".to_string()],
+        );
+        let mut repo_map = BTreeMap::new();
+        repo_map.insert("api-service".to_string(), prefix_map);
+        let mut pair_slots = BTreeMap::new();
+        pair_slots.insert("acme".to_string(), repo_map);
+
+        let conf = build_conf(&ws, &pair_slots);
+
+        assert!(conf.contains("# pair-programming: acme/api-service"));
+        assert!(conf.contains("repo acme-api-service"));
+        assert!(conf.contains("RW+ refs/heads/TICKET-42-*  =   alice bob"));
+    }
+
+    #[test]
+    fn pair_programming_multiple_prefixes() {
+        let mut ws = BTreeMap::new();
+        ws.insert("acme".into(), make_members(&[], &[]));
+
+        let mut prefix_map = BTreeMap::new();
+        prefix_map.insert("TICKET-1".to_string(), vec!["carol".to_string()]);
+        prefix_map.insert("TICKET-2".to_string(), vec!["dave".to_string(), "eve".to_string()]);
+        let mut repo_map = BTreeMap::new();
+        repo_map.insert("backend".to_string(), prefix_map);
+        let mut pair_slots = BTreeMap::new();
+        pair_slots.insert("acme".to_string(), repo_map);
+
+        let conf = build_conf(&ws, &pair_slots);
+
+        assert!(conf.contains("RW+ refs/heads/TICKET-1-*  =   carol"));
+        assert!(conf.contains("RW+ refs/heads/TICKET-2-*  =   dave eve"));
+    }
+
+    #[test]
+    fn pair_programming_empty_names_skipped() {
+        let mut ws = BTreeMap::new();
+        ws.insert("acme".into(), make_members(&[], &[]));
+
+        let mut prefix_map = BTreeMap::new();
+        prefix_map.insert("TICKET-99".to_string(), vec![]); // empty — should be skipped
+        let mut repo_map = BTreeMap::new();
+        repo_map.insert("svc".to_string(), prefix_map);
+        let mut pair_slots = BTreeMap::new();
+        pair_slots.insert("acme".to_string(), repo_map);
+
+        let conf = build_conf(&ws, &pair_slots);
+
+        // The repo block header is still emitted but no RW+ line for TICKET-99
+        assert!(!conf.contains("TICKET-99"));
+    }
+
+    #[test]
+    fn pair_programming_no_slots_no_extra_blocks() {
+        let mut ws = BTreeMap::new();
+        ws.insert("acme".into(), make_members(&["vriksh"], &[]));
+        let conf = build_conf(&ws, &BTreeMap::new());
+        assert!(!conf.contains("pair-programming"));
     }
 }

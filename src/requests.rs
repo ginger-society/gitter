@@ -58,7 +58,7 @@ pub struct KubeconfigRequest {
 
 /// Standard API response envelope.
 #[derive(Debug, Serialize, ToSchema)]
-pub struct ApiResponse {
+pub struct GenericResponse {
     /// `ok`, `accepted`, or `error`.
     pub status: &'static str,
     /// Human-readable detail (omitted on success where not needed).

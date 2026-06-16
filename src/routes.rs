@@ -22,19 +22,27 @@ use crate::handler_trigger_pipeline::{
     __path_handle_trigger_pipeline, handle_trigger_pipeline,
     TriggerPipelineRequest, TriggerPipelineResponse,
 };
-
 use crate::handle_run_pipeline::{
     __path_handle_run_pipeline, handle_run_pipeline, RunPipelineRequest,
-    RunPipelineResponse, PipelineParam
+    RunPipelineResponse, PipelineParam,
 };
-
+use crate::handler_pair_programming::{
+    __path_handle_add_pair_member,
+    __path_handle_remove_pair_member,
+    __path_handle_delete_pair_branch_config,
+    handle_add_pair_member,
+    handle_remove_pair_member,
+    handle_delete_pair_branch_config,
+    PairMemberRequest,
+    PairBranchConfigRequest,
+};
 use crate::merge_queue_handler::{
     __path_handle_merge_queue, handle_merge_queue,
     MergeQueueConflict, MergeQueueRequest, MergeQueueResponse,
 };
 use crate::rabbit::RabbitPoolRef;
 use crate::requests::{
-    AddMemberRequest, ApiResponse, CreateDbTaskRunRequest, DbTaskRunLogsRequest,
+    AddMemberRequest, GenericResponse, CreateDbTaskRunRequest, DbTaskRunLogsRequest,
     KubeconfigRequest, MemberTypeDto, RemoveMemberRequest, SquashRequest, SquashResponse,
     TaskRunCreateResponse, TaskRunLogsResponse, UpdatePipelineTokenRequest,
     UpdateTektonKubeconfigRequest,
@@ -67,14 +75,17 @@ use crate::state::AppState;
         handle_squash,
         handle_merge_queue,
         handle_trigger_pipeline,
-        handle_run_pipeline
+        handle_run_pipeline,
+        handle_add_pair_member,
+        handle_remove_pair_member,
+        handle_delete_pair_branch_config,
     ),
     components(schemas(
         AddMemberRequest,
         RemoveMemberRequest,
         MemberTypeDto,
         KubeconfigRequest,
-        ApiResponse,
+        GenericResponse,
         UpdateTektonKubeconfigRequest,
         UpdatePipelineTokenRequest,
         CreateDbTaskRunRequest,
@@ -103,7 +114,9 @@ use crate::state::AppState;
         TriggerPipelineResponse,
         RunPipelineRequest,
         RunPipelineResponse,
-        PipelineParam
+        PipelineParam,
+        PairMemberRequest,
+        PairBranchConfigRequest,
     )),
     modifiers(&SecurityAddon),
 )]
@@ -275,6 +288,39 @@ pub fn build(
         .and(with_state(state.clone()))
         .and_then(handle_run_pipeline);
 
+    // POST /pair-programming/member  — Auth: ISC
+    let add_pair_member = warp::post()
+        .and(warp::path("pair-programming"))
+        .and(warp::path("member"))
+        .and(warp::path::end())
+        .and(warp::body::content_length_limit(64 * 1024))
+        .and(warp::body::json())
+        .and(with_isc_auth())
+        .and(with_state(state.clone()))
+        .and_then(handle_add_pair_member);
+
+    // DELETE /pair-programming/member  — Auth: ISC
+    let remove_pair_member = warp::delete()
+        .and(warp::path("pair-programming"))
+        .and(warp::path("member"))
+        .and(warp::path::end())
+        .and(warp::body::content_length_limit(64 * 1024))
+        .and(warp::body::json())
+        .and(with_isc_auth())
+        .and(with_state(state.clone()))
+        .and_then(handle_remove_pair_member);
+
+    // DELETE /pair-programming/branch-config  — Auth: ISC
+    let delete_pair_branch_config = warp::delete()
+        .and(warp::path("pair-programming"))
+        .and(warp::path("branch-config"))
+        .and(warp::path::end())
+        .and(warp::body::content_length_limit(64 * 1024))
+        .and(warp::body::json())
+        .and(with_isc_auth())
+        .and(with_state(state.clone()))
+        .and_then(handle_delete_pair_branch_config);
+
     // GET /healthz  — no auth, k8s liveness probe
     let health = warp::get()
         .and(warp::path("healthz"))
@@ -311,6 +357,9 @@ pub fn build(
         .or(merge_queue)
         .or(trigger_pipeline)
         .or(run_pipeline)
+        .or(add_pair_member)
+        .or(remove_pair_member)
+        .or(delete_pair_branch_config)
         .or(health)
         .or(api_doc)
         .or(swagger_ui)
