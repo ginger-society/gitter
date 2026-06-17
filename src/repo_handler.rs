@@ -16,6 +16,11 @@ use crate::state::AppState;
 const REPOS_ROOT: &str = "/home/git/repositories";
 const FILE_CACHE_TTL: u64 = 10; // seconds
 
+/// Repos that are never readable via the public file endpoints, regardless of
+/// who is asking. The admin repo contains SSH keys, kubeconfigs, and tokens —
+/// none of which should be reachable over HTTP.
+const BLOCKED_REPOS: &[&str] = &["gitolite-admin"];
+
 // ── Request / Response types ──────────────────────────────────────────────────
 
 #[derive(Debug, serde::Deserialize, utoipa::ToSchema)]
@@ -146,6 +151,16 @@ pub struct OrgBranchCommitsResponse {
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
+
+/// Return true when the repo name (without `.git`) is on the block-list.
+/// Comparison is case-insensitive so `Gitolite-Admin`, `GITOLITE-ADMIN`, etc.
+/// are all rejected.
+fn is_blocked_repo(repo_name: &str) -> bool {
+    let bare = repo_name.trim_end_matches(".git");
+    BLOCKED_REPOS
+        .iter()
+        .any(|&blocked| bare.eq_ignore_ascii_case(blocked))
+}
 
 /// Resolve and open a bare repo, rejecting path-traversal attempts.
 fn open_repo(repo_name: &str) -> anyhow::Result<Repository> {
@@ -493,6 +508,7 @@ fn detect_conflicts(
     responses(
         (status = 200, description = "File metadata and optional highlighted lines", body = FileContentResponse),
         (status = 400, description = "Validation error",   body = GenericResponse),
+        (status = 403, description = "Access denied",      body = GenericResponse),
         (status = 404, description = "Repo/file not found",body = GenericResponse),
         (status = 500, description = "Internal error",     body = GenericResponse),
     )
@@ -501,6 +517,18 @@ pub async fn handle_file_content(
     body: FileContentRequest,
     state: AppState,
 ) -> Result<impl warp::Reply, Infallible> {
+    // ── Block access to sensitive repos ───────────────────────────────────────
+    if is_blocked_repo(&body.repo) {
+        warn!("[file] blocked read attempt on protected repo: {}", body.repo);
+        return Ok(warp::reply::with_status(
+            warp::reply::json(&GenericResponse {
+                status: "error",
+                message: Some(format!("access to repository '{}' is not permitted", body.repo)),
+            }),
+            StatusCode::FORBIDDEN,
+        ));
+    }
+
     let git_ref = match (&body.branch, &body.tag) {
         (Some(b), None)  => b.clone(),
         (None,  Some(t)) => t.clone(),
@@ -626,6 +654,10 @@ pub async fn handle_file_content(
 // Usable directly with curl / wget:
 //   curl http://localhost:3030/repo/file/raw/my-repo/main/src/main.rs
 //   wget http://localhost:3030/repo/file/raw/my-repo/main/src/main.rs
+//
+// NOTE: gitolite-admin (and any other repo in BLOCKED_REPOS) is unconditionally
+// rejected with 403. This is a hard security boundary — no path, branch, or
+// credential can bypass it.
 
 #[utoipa::path(
     get,
@@ -639,6 +671,7 @@ pub async fn handle_file_content(
     responses(
         (status = 200, description = "Raw file bytes",          content_type = "text/plain; charset=utf-8"),
         (status = 400, description = "Validation error",        body = GenericResponse),
+        (status = 403, description = "Access denied",           content_type = "text/plain; charset=utf-8"),
         (status = 404, description = "Repo or file not found",  body = GenericResponse),
         (status = 500, description = "Internal error",          body = GenericResponse),
     )
@@ -650,6 +683,18 @@ pub async fn handle_file_raw(
     state: AppState,
 ) -> Result<impl warp::Reply, Infallible> {
     let file_path = tail.as_str().trim_start_matches('/').to_string();
+
+    // ── Hard block on sensitive repos — checked before anything else ──────────
+    if is_blocked_repo(&repo_name) {
+        warn!(
+            "[file/raw] blocked read attempt on protected repo: {} (ref={} path={})",
+            repo_name, git_ref, file_path
+        );
+        return Ok(raw_error(
+            StatusCode::FORBIDDEN,
+            format!("access to repository '{}' is not permitted", repo_name),
+        ));
+    }
 
     // ── Basic validation ──────────────────────────────────────────────────────
     if repo_name.trim().is_empty() {

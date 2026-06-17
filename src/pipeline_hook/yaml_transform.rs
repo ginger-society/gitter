@@ -30,7 +30,7 @@ pub const DEPLOYMENT_TARGET_PLACEHOLDER: &str = "ginger-gitter/deployment-target
 // ── Public entry points ───────────────────────────────────────────────────────
 
 /// Transform a user-written Task YAML:
-/// - inject namespace
+/// - inject namespace only if not already specified in the YAML
 /// - replace deployment-target placeholder with real secret name
 /// - inject workspaces into spec.workspaces
 /// - inject GINGER_TOKEN env into every step
@@ -45,7 +45,8 @@ pub fn transform_task(
 
     let mut doc = parse(&yaml)?;
 
-    set_namespace(&mut doc, namespace);
+    // Only inject namespace when the task author hasn't specified one.
+    set_namespace_if_missing(&mut doc, namespace);
     inject_task_workspaces(&mut doc);
     inject_ginger_token_env(&mut doc);
 
@@ -53,7 +54,7 @@ pub fn transform_task(
 }
 
 /// Transform a user-written Pipeline YAML:
-/// - inject namespace
+/// - inject namespace (always — pipelines are always scoped to the derived namespace)
 /// - inject system params into spec.params
 /// - inject workspaces into spec.workspaces and each task's workspaces
 /// - prepend init-credentials → clone tasks
@@ -65,6 +66,7 @@ pub fn transform_pipeline(
 ) -> Result<String, String> {
     let mut doc = parse(yaml)?;
 
+    // Pipelines always get the derived namespace — no conditional here.
     set_namespace(&mut doc, namespace);
     inject_system_params(&mut doc);
     inject_pipeline_workspaces(&mut doc);
@@ -236,8 +238,22 @@ spec:
 
 // ── serde_yaml transformers ───────────────────────────────────────────────────
 
+/// Always overwrite metadata.namespace (used for Pipelines and builtins).
 fn set_namespace(doc: &mut Value, namespace: &str) {
     doc["metadata"]["namespace"] = val(namespace);
+}
+
+/// Inject metadata.namespace only when the document does not already have one.
+/// This preserves an explicit namespace written by the task author.
+fn set_namespace_if_missing(doc: &mut Value, namespace: &str) {
+    let already_set = doc["metadata"]["namespace"]
+        .as_str()
+        .map(|s| !s.trim().is_empty())
+        .unwrap_or(false);
+
+    if !already_set {
+        doc["metadata"]["namespace"] = val(namespace);
+    }
 }
 
 fn inject_system_params(doc: &mut Value) {
@@ -469,6 +485,24 @@ spec:
         echo hello
 "#;
 
+    const TASK_YAML_WITH_NAMESPACE: &str = r#"
+apiVersion: tekton.dev/v1beta1
+kind: Task
+metadata:
+  name: build-and-push
+  namespace: my-custom-namespace
+spec:
+  params:
+    - name: image_tag
+      type: string
+  steps:
+    - name: build
+      image: gingersociety/tekton-task-buildah:latest
+      script: |
+        #!/bin/bash
+        echo hello
+"#;
+
     const PIPELINE_YAML: &str = r#"
 apiVersion: tekton.dev/v1beta1
 kind: Pipeline
@@ -491,15 +525,38 @@ spec:
 "#;
 
     #[test]
-    fn test_task_namespace_injected() {
+    fn test_task_namespace_injected_when_missing() {
         let out = transform_task(TASK_YAML, "tasks-my-repo", "deployment-target-main").unwrap();
         let doc: Value = serde_yaml::from_str(&out).unwrap();
         assert_eq!(doc["metadata"]["namespace"].as_str(), Some("tasks-my-repo"));
     }
 
     #[test]
+    fn test_task_namespace_preserved_when_already_set() {
+        let out = transform_task(TASK_YAML_WITH_NAMESPACE, "tasks-my-repo", "deployment-target-main").unwrap();
+        let doc: Value = serde_yaml::from_str(&out).unwrap();
+        // The author's explicit namespace must be kept, not overwritten.
+        assert_eq!(doc["metadata"]["namespace"].as_str(), Some("my-custom-namespace"));
+    }
+
+    #[test]
     fn test_task_workspaces_injected() {
         let out = transform_task(TASK_YAML, "tasks-my-repo", "deployment-target-main").unwrap();
+        let doc: Value = serde_yaml::from_str(&out).unwrap();
+        let ws_names: Vec<&str> = doc["spec"]["workspaces"]
+            .as_sequence().unwrap()
+            .iter()
+            .filter_map(|w| w["name"].as_str())
+            .collect();
+        for &ws in INJECTED_WORKSPACES {
+            assert!(ws_names.contains(&ws), "missing workspace: {}", ws);
+        }
+    }
+
+    #[test]
+    fn test_task_workspaces_injected_even_when_namespace_preserved() {
+        // Workspaces must still be injected regardless of whether namespace was preserved.
+        let out = transform_task(TASK_YAML_WITH_NAMESPACE, "tasks-my-repo", "deployment-target-main").unwrap();
         let doc: Value = serde_yaml::from_str(&out).unwrap();
         let ws_names: Vec<&str> = doc["spec"]["workspaces"]
             .as_sequence().unwrap()
@@ -532,6 +589,18 @@ spec:
         let out = transform_task(&yaml, "ns", "deployment-target-dev-alice").unwrap();
         assert!(out.contains("deployment-target-dev-alice"));
         assert!(!out.contains("ginger-gitter/deployment-target"));
+    }
+
+    #[test]
+    fn test_pipeline_namespace_always_overwritten() {
+        // Pipelines always get the derived namespace, even if one is set.
+        let yaml_with_ns = PIPELINE_YAML.replace(
+            "name: build-pipeline",
+            "name: build-pipeline\n  namespace: some-other-namespace",
+        );
+        let out = transform_pipeline(&yaml_with_ns, "tasks-my-repo", "my-repo").unwrap();
+        let doc: Value = serde_yaml::from_str(&out).unwrap();
+        assert_eq!(doc["metadata"]["namespace"].as_str(), Some("tasks-my-repo"));
     }
 
     #[test]
