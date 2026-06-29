@@ -8,7 +8,6 @@ use std::process::ExitCode;
 const ADMIN_GIT_DIR: &str = "/home/git/repositories/gitolite-admin.git";
 const REPOS_DIR: &str = "/home/git/repositories";
 const SIDECAR_URL: &str = "http://ginger-gitter-sidecar:8080";
-const CLUSTER_TTL_SECONDS: u32 = 5 * 24 * 60 * 60;
 
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().collect();
@@ -23,7 +22,7 @@ fn main() -> ExitCode {
 
     match pipeline::run(
         &args[1], &args[2], &args[3], &args[4], &args[5],
-        ADMIN_GIT_DIR, REPOS_DIR, SIDECAR_URL, CLUSTER_TTL_SECONDS,
+        ADMIN_GIT_DIR, REPOS_DIR, SIDECAR_URL,
     ) {
         Ok(_) => ExitCode::SUCCESS,
         Err(e) => {

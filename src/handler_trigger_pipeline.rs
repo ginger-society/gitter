@@ -1,11 +1,9 @@
 // src/handler_trigger_pipeline.rs
-//
-
 
 use std::convert::Infallible;
 use std::path::PathBuf;
 
-use tracing::{error, info, warn};
+use tracing::{error, info};
 use warp::http::StatusCode;
 
 use crate::{handle_run_pipeline::resolve_head, state::AppState};
@@ -13,7 +11,6 @@ use crate::{handle_run_pipeline::resolve_head, state::AppState};
 const REPOS_DIR: &str = "/home/git/repositories";
 const ADMIN_GIT_DIR: &str = "/home/git/repositories/gitolite-admin.git";
 const SIDECAR_URL: &str = "http://ginger-gitter-sidecar:8080";
-const CLUSTER_TTL_SECONDS: u32 = 5 * 24 * 60 * 60;
 
 // ── Request / Response ────────────────────────────────────────────────────────
 
@@ -40,6 +37,19 @@ pub struct TriggerPipelineResponse {
     pub branch: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub commit: Option<String>,
+    /// Names of the PipelineRuns that were created, in trigger order.
+    /// Empty on error responses.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub pipeline_runs: Vec<PipelineRunInfo>,
+}
+
+/// Minimal info about a single triggered PipelineRun — enough for the
+/// caller (e.g. ginger-code push --force-pipeline) to open the TUI.
+#[derive(Debug, serde::Serialize, utoipa::ToSchema)]
+pub struct PipelineRunInfo {
+    pub pipeline_name: String,
+    pub run_name: String,
+    pub namespace: String,
 }
 
 // ── Handler ───────────────────────────────────────────────────────────────────
@@ -74,16 +84,16 @@ pub async fn handle_trigger_pipeline(
 
     info!("POST /repo/trigger-pipeline repo={repo} branch={branch} triggered_by={gl_user}");
 
-    // ── Resolve branch HEAD (blocking I/O — off the async executor) ───────────
+    // ── Resolve branch HEAD ───────────────────────────────────────────────────
     let repo_path = PathBuf::from(format!("{REPOS_DIR}/{repo}.git"));
     if !repo_path.exists() {
         return Ok(err(StatusCode::NOT_FOUND, &format!("repository '{repo}' not found"), &repo, &branch, None));
     }
 
-    let refname   = format!("refs/heads/{branch}");
-    let rp        = repo_path.clone();
-    let rf        = refname.clone();
-    let new_rev   = match tokio::task::spawn_blocking(move || resolve_head(&rp, &rf)).await {
+    let refname = format!("refs/heads/{branch}");
+    let rp = repo_path.clone();
+    let rf = refname.clone();
+    let new_rev = match tokio::task::spawn_blocking(move || resolve_head(&rp, &rf)).await {
         Ok(Ok(sha)) => sha,
         Ok(Err(e))  => return Ok(err(StatusCode::NOT_FOUND, &format!("branch '{branch}' not found: {e}"), &repo, &branch, None)),
         Err(e)      => return Ok(err(StatusCode::INTERNAL_SERVER_ERROR, &format!("internal error: {e}"), &repo, &branch, None)),
@@ -91,11 +101,7 @@ pub async fn handle_trigger_pipeline(
 
     info!("[trigger] {refname} → {new_rev}");
 
-    // ── Delegate to the shared pipeline_hook::pipeline::run() ─────────────────
-    //
-    // old_rev = all-zeros: get_changed_files() treats this as a new branch and
-    // runs `git diff-tree --no-commit-id -r <new_rev>`, giving the files touched
-    // by the tip commit. path-filter / ignore-paths work normally.
+    // ── Delegate to pipeline::run() ───────────────────────────────────────────
     let r  = repo.clone();
     let rv = new_rev.clone();
     let rf = refname.clone();
@@ -103,28 +109,38 @@ pub async fn handle_trigger_pipeline(
 
     let result = tokio::task::spawn_blocking(move || {
         crate::pipeline_hook::pipeline::run(
-            &u,                                          // gl_user
-            &r,                                          // gl_repo
-            &rf,                                         // refname
-            "0000000000000000000000000000000000000000",  // old_rev
-            &rv,                                         // new_rev
+            &u,
+            &r,
+            &rf,
+            "0000000000000000000000000000000000000000",
+            &rv,
             ADMIN_GIT_DIR,
             REPOS_DIR,
             SIDECAR_URL,
-            CLUSTER_TTL_SECONDS,
         )
     }).await;
 
     match result {
-        Ok(Ok(())) => {
-            info!("[trigger] ✓ pipelines triggered for {repo}/{branch}");
+        Ok(Ok(pipeline_runs)) => {
+            info!("[trigger] ✓ {} pipeline(s) triggered for {repo}/{branch}", pipeline_runs.len());
+
+            let runs: Vec<PipelineRunInfo> = pipeline_runs
+                .into_iter()
+                .map(|(pipeline_name, run_name, namespace)| PipelineRunInfo {
+                    pipeline_name,
+                    run_name,
+                    namespace,
+                })
+                .collect();
+
             Ok(warp::reply::with_status(
                 warp::reply::json(&TriggerPipelineResponse {
-                    status:  "ok",
+                    status: "ok",
                     message: format!("pipelines triggered for {repo}@{branch}"),
                     repo,
                     branch,
-                    commit:  Some(new_rev),
+                    commit: Some(new_rev),
+                    pipeline_runs: runs,
                 }),
                 StatusCode::OK,
             ))
@@ -142,7 +158,6 @@ pub async fn handle_trigger_pipeline(
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-
 fn err(
     code: StatusCode,
     message: &str,
@@ -157,6 +172,7 @@ fn err(
             repo:    repo.to_string(),
             branch:  branch.to_string(),
             commit:  commit.map(str::to_string),
+            pipeline_runs: Vec::new(),
         }),
         code,
     )

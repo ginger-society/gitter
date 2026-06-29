@@ -12,9 +12,15 @@ use crate::pipeline_hook::kubectl::{
 use crate::pipeline_hook::types::{PipelineDefinition, PipelineRunContext};
 use crate::pipeline_hook::yaml::{parse_pipeline_yaml, should_trigger};
 use crate::pipeline_hook::yaml_transform::{
-    build_pipeline_run, builtin_clone_task, builtin_init_credentials_task, sanitize_label, transform_pipeline, transform_task
+    build_pipeline_run, builtin_clone_task, builtin_init_credentials_task, sanitize_label,
+    transform_pipeline, transform_task,
 };
 
+/// Run the full pipeline hook for a push event.
+///
+/// Returns a list of `(pipeline_name, run_name, namespace)` tuples for every
+/// PipelineRun that was successfully created, in trigger order. The list is
+/// empty when no pipelines matched the trigger conditions (not an error).
 pub fn run(
     gl_user: &str,
     gl_repo: &str,
@@ -24,22 +30,20 @@ pub fn run(
     admin_git_dir: &str,
     repos_dir: &str,
     sidecar_url: &str,
-    cluster_ttl_seconds: u32,
-) -> Result<(), String> {
+) -> Result<Vec<(String, String, String)>, String> {
 
     // ── 1. Derive branch name ─────────────────────────────────────────────────
     let branch = refname.strip_prefix("refs/heads/").ok_or("invalid refname")?;
     let is_main = branch == "main";
-    let is_dev_branch = branch.starts_with("dev-");
     println!("[ginger-gitter] Branch: {}", branch);
 
     if !refname.starts_with("refs/heads/") {
         println!("[ginger-gitter] Skipping non-branch ref: {}", refname);
-        return Ok(());
+        return Ok(vec![]);
     }
     if new_rev.chars().all(|c| c == '0') {
         println!("[ginger-gitter] Skipping branch deletion");
-        return Ok(());
+        return Ok(vec![]);
     }
 
     // ── 2. Resolve workspace ──────────────────────────────────────────────────
@@ -68,7 +72,7 @@ pub fn run(
     let tekton_files = list_tekton_files(&repo_path, new_rev)?;
     if tekton_files.is_empty() {
         println!("[ginger-gitter] No .tekton pipeline files found — nothing to trigger");
-        return Ok(());
+        return Ok(vec![]);
     }
     println!("[ginger-gitter] Found {} pipeline file(s):", tekton_files.len());
     for f in &tekton_files {
@@ -87,7 +91,7 @@ pub fn run(
 
     if triggered.is_empty() {
         println!("[ginger-gitter] No pipelines matched trigger conditions for this push");
-        return Ok(());
+        return Ok(vec![]);
     }
     println!("[ginger-gitter] {} pipeline(s) will be triggered:", triggered.len());
     for p in &triggered {
@@ -95,10 +99,6 @@ pub fn run(
     }
 
     // ── 8. Resolve per-workspace kubeconfig (optional) ───────────────────────
-    // A missing kubeconfig is non-fatal — the build/test pipeline runs fine
-    // without a deployment target. The kubeconfig is only needed if a pipeline
-    // task actually deploys somewhere. We pass None and let individual tasks
-    // decide whether they need it.
     let workspace_kubeconfig_key = if is_main {
         format!("kubeconfig/{}/staging.yaml", workspace)
     } else {
@@ -109,34 +109,33 @@ pub fn run(
         workspace_kubeconfig_key
     );
 
-    let workspace_kubeconfig: Option<String> = match read_from_admin_repo(admin_git_dir, &workspace_kubeconfig_key) {
-        Ok(kc) => {
-            println!("[ginger-gitter] ✓ Workspace kubeconfig found ({} bytes)", kc.len());
-            Some(kc)
-        }
-        Err(_) => {
-            println!(
-                "[ginger-gitter] ⚠ No workspace kubeconfig found for '{}' —                  pipeline will run but deployment steps (if any) will have no target",
-                workspace_kubeconfig_key
-            );
-            None
-        }
-    };
+    let workspace_kubeconfig: Option<String> =
+        match read_from_admin_repo(admin_git_dir, &workspace_kubeconfig_key) {
+            Ok(kc) => {
+                println!("[ginger-gitter] ✓ Workspace kubeconfig found ({} bytes)", kc.len());
+                Some(kc)
+            }
+            Err(_) => {
+                println!(
+                    "[ginger-gitter] ⚠ No workspace kubeconfig found for '{}' — \
+                     pipeline will run but deployment steps (if any) will have no target",
+                    workspace_kubeconfig_key
+                );
+                None
+            }
+        };
 
-    // ── 9. Read Tekton kubeconfig from admin repo root ────────────────────────
+    // ── 9. Read Tekton kubeconfig ─────────────────────────────────────────────
     println!("[ginger-gitter] Reading Tekton control plane kubeconfig …");
     let tekton_kubeconfig = read_from_admin_repo(admin_git_dir, "kubeconfig.yaml")
-        .map_err(|e| format!("tekton kubeconfig not found in admin repo root: {e} — has it been uploaded via /tekton-kubeconfig?"))?;
+        .map_err(|e| format!("tekton kubeconfig not found in admin repo root: {e}"))?;
     println!("[ginger-gitter] ✓ Tekton kubeconfig loaded ({} bytes)", tekton_kubeconfig.len());
 
     // ── 10. Read workspace pipeline token ────────────────────────────────────
     let pipeline_token_key = format!("pipeline-tokens/{}", workspace);
     println!("[ginger-gitter] Reading pipeline token for workspace '{}' …", workspace);
     let ginger_token = read_from_admin_repo(admin_git_dir, &pipeline_token_key)
-        .map_err(|e| format!(
-            "GINGER_TOKEN not found at '{}': {} — has it been uploaded via /pipeline-token?",
-            pipeline_token_key, e
-        ))?;
+        .map_err(|e| format!("GINGER_TOKEN not found at '{}': {}", pipeline_token_key, e))?;
     println!("[ginger-gitter] ✓ GINGER_TOKEN loaded ({} bytes)", ginger_token.trim().len());
 
     // ── 11. Build pipeline run context ────────────────────────────────────────
@@ -159,15 +158,12 @@ pub fn run(
     println!("[ginger-gitter]   branch         : {}", context.gl_branch);
     println!("[ginger-gitter]   new_rev        : {}", context.gl_new_rev);
     println!("[ginger-gitter]   changed_files  : {}", context.gl_changed_files.len());
-    println!("[ginger-gitter]   deploy target  : {}",
+    println!(
+        "[ginger-gitter]   deploy target  : {}",
         if context.kubeconfig.is_some() { "✓ kubeconfig present" } else { "⚠ none (build only)" }
     );
 
     // ── 12. Trigger each matched pipeline ─────────────────────────────────────
-    // Namespace convention: tasks-<repo-basename>.
-    // gl_repo is a gitolite path like "rackmint/rackmint-provisioner-service";
-    // we use only the final component after the last '/' so we don't duplicate
-    // the workspace prefix that gitolite already includes in the repo name itself.
     let repo_basename = gl_repo
         .rsplit('/')
         .next()
@@ -176,10 +172,12 @@ pub fn run(
     let namespace = format!("tasks-{}", repo_basename);
     println!("[ginger-gitter] Target namespace: {}", namespace);
 
+    let mut created_runs: Vec<(String, String, String)> = Vec::new();
+
     for pipeline in &triggered {
         println!("[ginger-gitter] Triggering pipeline: {}", pipeline.name);
 
-        trigger_pipeline(
+        let run_name = trigger_pipeline(
             pipeline,
             &context,
             &tekton_kubeconfig,
@@ -190,15 +188,18 @@ pub fn run(
             &namespace,
         )?;
 
-        println!("[ginger-gitter] ✓ Pipeline triggered: {}", pipeline.name);
+        println!("[ginger-gitter] ✓ PipelineRun/{} created", run_name);
+        created_runs.push((pipeline.pipeline_name.clone(), run_name, namespace.clone()));
     }
 
     println!("[ginger-gitter] ✓ All pipelines triggered successfully");
-    Ok(())
+    Ok(created_runs)
 }
 
 /// Full pipeline trigger: ensure namespace + PVCs + secret, apply tasks +
 /// pipeline, then create PipelineRun.
+///
+/// Returns the name of the created PipelineRun.
 fn trigger_pipeline(
     pipeline: &PipelineDefinition,
     ctx: &PipelineRunContext,
@@ -208,36 +209,30 @@ fn trigger_pipeline(
     tekton_files: &[String],
     gl_repo: &str,
     namespace: &str,
-) -> Result<(), String> {
+) -> Result<String, String> {
 
-    // ── 12a. Ensure namespace exists ─────────────────────────────────────────
+    // ── 12a. Ensure namespace ─────────────────────────────────────────────────
     println!("[ginger-gitter] Ensuring namespace: {}", namespace);
     ensure_namespace(tekton_kubeconfig, namespace)
         .map_err(|e| format!("failed to ensure namespace {}: {}", namespace, e))?;
 
-    // ── 12b. Ensure cluster-level NFS PV then namespace PVCs ────────────────
-    // buildah-cache-pv must exist at cluster scope before buildah-cache-pvc
-    // can bind. ensure_buildah_pv is idempotent — no-ops if PV already exists.
+    // ── 12b. Ensure PVs + PVCs ───────────────────────────────────────────────
     println!("[ginger-gitter] Ensuring buildah-cache-pv (cluster-level NFS PV) …");
-    ensure_buildah_pv(tekton_kubeconfig, &namespace)
+    ensure_buildah_pv(tekton_kubeconfig, namespace)
         .map_err(|e| format!("failed to ensure buildah-cache-pv: {}", e))?;
 
     println!("[ginger-gitter] Ensuring PVCs in namespace: {}", namespace);
     ensure_pvcs(tekton_kubeconfig, namespace)
         .map_err(|e| format!("failed to ensure PVCs in {}: {}", namespace, e))?;
 
-    // ── 12c. Ensure ginger-token-secret exists ────────────────────────────────
+    // ── 12c. Ensure ginger-token-secret ──────────────────────────────────────
     println!("[ginger-gitter] Ensuring ginger-token-secret in namespace: {}", namespace);
     ensure_ginger_token_secret(tekton_kubeconfig, namespace, &ctx.ginger_token)
         .map_err(|e| format!("failed to ensure ginger-token-secret: {}", e))?;
 
-    // ── 12d. Ensure deployment-target secret (branch-scoped) ─────────────────
-    // Named deployment-target-<branch> so concurrent pipelines on different
-    // branches never collide. No-op when no kubeconfig is available yet.
-    let deployment_target_secret_name = format!(
-        "deployment-target-{}",
-        sanitize_secret_name(&ctx.gl_branch)
-    );
+    // ── 12d. Ensure deployment-target secret ─────────────────────────────────
+    let deployment_target_secret_name =
+        format!("deployment-target-{}", sanitize_secret_name(&ctx.gl_branch));
     println!(
         "[ginger-gitter] Ensuring deployment target secret: {}",
         deployment_target_secret_name
@@ -250,7 +245,7 @@ fn trigger_pipeline(
     )
     .map_err(|e| format!("failed to ensure deployment target secret: {}", e))?;
 
-    // ── 12e. Apply built-in tasks (init-credentials, clone) ──────────────────
+    // ── 12e. Apply built-in tasks ─────────────────────────────────────────────
     println!("[ginger-gitter] Applying built-in tasks …");
     let init_creds_yaml = builtin_init_credentials_task(namespace);
     kubectl_apply(tekton_kubeconfig, &init_creds_yaml)
@@ -262,7 +257,7 @@ fn trigger_pipeline(
         .map_err(|e| format!("failed to apply clone task: {}", e))?;
     println!("[ginger-gitter] ✓ clone task applied");
 
-    // ── 12f. Apply user-defined tasks from .tekton/tasks/ ────────────────────
+    // ── 12f. Apply user-defined tasks ────────────────────────────────────────
     let task_files: Vec<&String> = tekton_files
         .iter()
         .filter(|f| {
@@ -276,9 +271,9 @@ fn trigger_pipeline(
     for task_file in &task_files {
         match read_file_from_commit(repo_path, new_rev, task_file) {
             Ok(raw_yaml) => {
-                let transformed = transform_task(&raw_yaml, namespace, &deployment_target_secret_name)
-                    .map_err(|e| format!("failed to transform task {}: {}", task_file, e))?;
-
+                let transformed =
+                    transform_task(&raw_yaml, namespace, &deployment_target_secret_name)
+                        .map_err(|e| format!("failed to transform task {}: {}", task_file, e))?;
                 println!("[ginger-gitter] Applying task: {}", task_file);
                 kubectl_apply(tekton_kubeconfig, &transformed)
                     .map_err(|e| format!("failed to apply task {}: {}", task_file, e))?;
@@ -293,7 +288,7 @@ fn trigger_pipeline(
         }
     }
 
-    // ── 12g. Apply pipeline from source file ──────────────────────────────────
+    // ── 12g. Apply pipeline ───────────────────────────────────────────────────
     println!("[ginger-gitter] Applying pipeline: {}", pipeline.source_file);
     let pipeline_raw = read_file_from_commit(repo_path, new_rev, &pipeline.source_file)
         .map_err(|e| format!("failed to read pipeline file {}: {}", pipeline.source_file, e))?;
@@ -310,9 +305,7 @@ fn trigger_pipeline(
         cancel_running_pipeline_runs(tekton_kubeconfig, namespace, &pipeline.pipeline_name, ctx)?;
     }
 
-    // ── 12i. Create PipelineRun ────────────────────────────────────────────────
-    // Build user params from pipeline params (empty map — pipeline uses its defaults;
-    // callers can extend this with annotation-driven params in the future)
+    // ── 12i. Create PipelineRun ───────────────────────────────────────────────
     let user_params: HashMap<String, String> = HashMap::new();
 
     let pipeline_run_yaml = build_pipeline_run(
@@ -326,15 +319,12 @@ fn trigger_pipeline(
     );
 
     println!("[ginger-gitter] Creating PipelineRun for: {}", pipeline.pipeline_name);
-    let created = create_pipeline_run(tekton_kubeconfig, &pipeline_run_yaml)
+    let run_name = create_pipeline_run(tekton_kubeconfig, &pipeline_run_yaml)
         .map_err(|e| format!("failed to create PipelineRun for {}: {}", pipeline.name, e))?;
-    println!("[ginger-gitter] ✓ PipelineRun created: {}", created.trim());
 
-    Ok(())
+    Ok(run_name.trim().to_string())
 }
 
-/// Cancel any currently-running PipelineRuns for this pipeline (concurrency: cancel-previous).
-/// Cancel any currently-running PipelineRuns for this pipeline (concurrency: cancel-previous).
 fn cancel_running_pipeline_runs(
     tekton_kubeconfig: &str,
     namespace: &str,
@@ -354,7 +344,6 @@ fn cancel_running_pipeline_runs(
     let repo_label = sanitize_label(&ctx.gl_repo);
 
     rt().block_on(async {
-        // ── Build client ──────────────────────────────────────────────────────
         let kc: Kubeconfig = serde_yaml::from_str(tekton_kubeconfig)
             .map_err(|e| format!("failed to parse kubeconfig: {e}"))?;
         let cfg = KubeConfig::from_custom_kubeconfig(kc, &KubeConfigOptions::default())
@@ -363,7 +352,6 @@ fn cancel_running_pipeline_runs(
         let client = Client::try_from(cfg)
             .map_err(|e| format!("failed to create kube client: {e}"))?;
 
-        // ── Dynamic API for PipelineRun (Tekton CRD) ──────────────────────────
         let ar = kube::discovery::ApiResource {
             group:       "tekton.dev".to_string(),
             version:     "v1beta1".to_string(),
@@ -374,8 +362,6 @@ fn cancel_running_pipeline_runs(
         let api: Api<kube::core::DynamicObject> =
             Api::namespaced_with(client, namespace, &ar);
 
-        // ── List by label selector ────────────────────────────────────────────
-        // Matches what the pipeline hook writes when it creates PipelineRuns.
         let label_selector = format!(
             "tekton.dev/pipeline={},ginger-gitter/repo={}",
             pipeline_name, repo_label
@@ -391,11 +377,6 @@ fn cancel_running_pipeline_runs(
             return Ok(());
         }
 
-        // ── Filter to only Running ones ───────────────────────────────────────
-        // Tekton marks running PipelineRuns with:
-        //   .status.conditions[0].reason == "Running"
-        // We check this in the JSON data rather than via a field-selector
-        // (field selectors on CRD status fields are not supported by Tekton).
         let running: Vec<_> = list
             .items
             .iter()
@@ -413,7 +394,6 @@ fn cancel_running_pipeline_runs(
             return Ok(());
         }
 
-        // ── Patch each running PipelineRun to CancelledRunFinally ─────────────
         let patch_params = PatchParams::default();
         let cancel_patch: serde_json::Value =
             serde_json::json!({ "spec": { "status": "CancelledRunFinally" } });
@@ -441,7 +421,6 @@ fn parse_pipeline_files(
     new_rev: &str,
     files: &[String],
 ) -> Result<Vec<PipelineDefinition>, String> {
-    // Only parse top-level .tekton/*.yaml files as pipelines (not .tekton/tasks/*)
     let pipeline_files: Vec<&String> = files
         .iter()
         .filter(|f| {
@@ -469,20 +448,16 @@ fn parse_pipeline_files(
     Ok(pipelines)
 }
 
-/// Sanitize a branch name for use in a Kubernetes secret name.
-/// Secret names must be DNS subdomains: lowercase alphanumeric and '-', max 253 chars.
 fn sanitize_secret_name(branch: &str) -> String {
     let lowered = branch.to_lowercase();
     let cleaned: String = lowered
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '-' })
         .collect();
-    // Collapse consecutive dashes, trim leading/trailing dashes
     let collapsed = cleaned
         .split('-')
         .filter(|s| !s.is_empty())
         .collect::<Vec<_>>()
         .join("-");
-    // Truncate to 253 chars (leaving room for "deployment-target-" prefix = 18 chars)
     collapsed[..235.min(collapsed.len())].to_string()
 }
