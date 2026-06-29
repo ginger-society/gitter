@@ -16,6 +16,17 @@ use crate::pipeline_hook::yaml_transform::{
     transform_pipeline, transform_task,
 };
 
+
+fn parse_run_name(raw: &str) -> String {
+    // kubectl output format: "<resource>/<name>  <verb>"
+    // Take the first whitespace-delimited token, then take everything after the '/'
+    raw.split_whitespace()
+        .next()
+        .and_then(|token| token.split('/').nth(1))
+        .unwrap_or(raw)
+        .to_string()
+}
+
 /// Run the full pipeline hook for a push event.
 ///
 /// Returns a list of `(pipeline_name, run_name, namespace)` tuples for every
@@ -322,7 +333,7 @@ fn trigger_pipeline(
     let run_name = create_pipeline_run(tekton_kubeconfig, &pipeline_run_yaml)
         .map_err(|e| format!("failed to create PipelineRun for {}: {}", pipeline.name, e))?;
 
-    Ok(run_name.trim().to_string())
+    Ok(parse_run_name(run_name.trim()))
 }
 
 fn cancel_running_pipeline_runs(
