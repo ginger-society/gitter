@@ -19,8 +19,7 @@ use crate::handler_create_db_taskrun::{
     handle_create_db_taskrun, handle_db_taskrun_logs,
 };
 use crate::handler_trigger_pipeline::{
-    __path_handle_trigger_pipeline, handle_trigger_pipeline,
-    TriggerPipelineRequest, TriggerPipelineResponse,
+    __path_handle_trigger_pipeline, PipelineRunInfo, TriggerPipelineRequest, TriggerPipelineResponse, handle_trigger_pipeline,
 };
 use crate::handle_run_pipeline::{
     __path_handle_run_pipeline, handle_run_pipeline, RunPipelineRequest,
@@ -119,6 +118,7 @@ use crate::state::AppState;
         PipelineParam,
         PairMemberRequest,
         PairBranchConfigRequest,
+        PipelineRunInfo
     )),
     modifiers(&SecurityAddon),
 )]
