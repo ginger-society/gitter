@@ -420,7 +420,7 @@ pub async fn handle_run_pipeline(
     t!("✓ Read {} bytes", pipeline_raw.len());
 
     t!("Transforming pipeline YAML (namespace={namespace}) …");
-    let pipeline_transformed = match transform_pipeline(&pipeline_raw, &namespace, &repo) {
+    let pipeline_transformed = match transform_pipeline(&pipeline_raw, &namespace) {
         Ok(y) => y,
         Err(e) => {
             t!("ERROR: transform_pipeline failed: {e}");

@@ -304,7 +304,7 @@ fn trigger_pipeline(
     let pipeline_raw = read_file_from_commit(repo_path, new_rev, &pipeline.source_file)
         .map_err(|e| format!("failed to read pipeline file {}: {}", pipeline.source_file, e))?;
 
-    let pipeline_transformed = transform_pipeline(&pipeline_raw, namespace, gl_repo)
+    let pipeline_transformed = transform_pipeline(&pipeline_raw, namespace)
         .map_err(|e| format!("failed to transform pipeline {}: {}", pipeline.source_file, e))?;
 
     kubectl_apply(tekton_kubeconfig, &pipeline_transformed)
