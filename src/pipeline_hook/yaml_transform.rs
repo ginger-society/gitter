@@ -46,9 +46,27 @@ pub fn transform_task(
     let mut doc = parse(&yaml)?;
 
     // Only inject namespace when the task author hasn't specified one.
+    // This is safe for any kind — metadata.namespace is a universal field.
     set_namespace_if_missing(&mut doc, namespace);
-    inject_task_workspaces(&mut doc);
-    inject_ginger_token_env(&mut doc);
+
+    // spec.workspaces and spec.steps are specific to a real Tekton `Task`
+    // object and are NOT part of the RemoteTask CRD schema (which only
+    // declares capability/script/cleanup/env). Injecting them into a
+    // RemoteTask doc makes the API server's server-side-apply typed-patch
+    // computation fail with "field not declared in schema", since it can't
+    // represent an undeclared field. A standalone RemoteTask gets its
+    // workspace/credential wiring from the CustomRun's `creds` workspace
+    // binding instead (see customrun.rs), so it needs neither injection.
+    let kind = doc["kind"].as_str().unwrap_or("");
+    if kind == "Task" {
+        inject_task_workspaces(&mut doc);
+        inject_ginger_token_env(&mut doc);
+    } else {
+        println!(
+            "[ginger-gitter] '{}' — skipping Task-specific workspace/env injection (kind: {})",
+            namespace, kind
+        );
+    }
 
     serialize(&doc)
 }
