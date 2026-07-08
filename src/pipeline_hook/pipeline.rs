@@ -16,6 +16,13 @@ use crate::pipeline_hook::yaml_transform::{
     transform_pipeline, transform_task,
 };
 
+/// A `.tekton/**` file counts as a shared task/RemoteTask definition
+/// (as opposed to a pipeline definition) if it lives under a `tasks/` folder.
+fn is_task_file(f: &str) -> bool {
+    let lower = f.to_lowercase();
+    (lower.contains("/tasks/") || lower.contains("\\tasks\\"))
+        && (lower.ends_with(".yaml") || lower.ends_with(".yml"))
+}
 
 fn parse_run_name(raw: &str) -> String {
     // kubectl output format: "<resource>/<name>  <verb>"
@@ -101,7 +108,51 @@ pub fn run(
         .collect();
 
     if triggered.is_empty() {
-        println!("[ginger-gitter] No pipelines matched trigger conditions for this push");
+        // No pipeline matched — but the repo may still define shared
+        // Task/RemoteTask CRDs (e.g. an IAC repo whose only purpose is to
+        // host common tasks in `default` for other pipelines to reference
+        // via the cluster resolver). Apply those regardless of whether any
+        // pipeline in *this* repo is meant to run.
+        let task_files: Vec<&String> = tekton_files.iter().filter(|f| is_task_file(f)).collect();
+
+        if task_files.is_empty() {
+            println!("[ginger-gitter] No pipelines matched trigger conditions for this push");
+            return Ok(vec![]);
+        }
+
+        println!(
+            "[ginger-gitter] No pipelines matched trigger conditions, but found {} shared task file(s) — applying them",
+            task_files.len()
+        );
+
+        println!("[ginger-gitter] Reading Tekton control plane kubeconfig …");
+        let tekton_kubeconfig = read_from_admin_repo(admin_git_dir, "kubeconfig.yaml")
+            .map_err(|e| format!("tekton kubeconfig not found in admin repo root: {e}"))?;
+
+        for task_file in &task_files {
+            match read_file_from_commit(&repo_path, new_rev, task_file) {
+                Ok(raw_yaml) => {
+                    // Shared tasks are expected to declare their own
+                    // metadata.namespace (e.g. "default"); "default" here is
+                    // only a fallback for files that omit it, and the empty
+                    // string means the deployment-target placeholder is a
+                    // no-op if a shared task never references it.
+                    let transformed = transform_task(&raw_yaml, "default", "")
+                        .map_err(|e| format!("failed to transform shared task {}: {}", task_file, e))?;
+                    println!("[ginger-gitter] Applying shared task: {}", task_file);
+                    kubectl_apply(&tekton_kubeconfig, &transformed)
+                        .map_err(|e| format!("failed to apply shared task {}: {}", task_file, e))?;
+                    println!("[ginger-gitter] ✓ Shared task applied: {}", task_file);
+                }
+                Err(e) => {
+                    println!(
+                        "[ginger-gitter] WARNING: could not read shared task file {}: {} — skipping",
+                        task_file, e
+                    );
+                }
+            }
+        }
+
         return Ok(vec![]);
     }
     println!("[ginger-gitter] {} pipeline(s) will be triggered:", triggered.len());
@@ -269,14 +320,8 @@ fn trigger_pipeline(
     println!("[ginger-gitter] ✓ clone task applied");
 
     // ── 12f. Apply user-defined tasks ────────────────────────────────────────
-    let task_files: Vec<&String> = tekton_files
-        .iter()
-        .filter(|f| {
-            let lower = f.to_lowercase();
-            (lower.contains("/tasks/") || lower.contains("\\tasks\\"))
-                && (lower.ends_with(".yaml") || lower.ends_with(".yml"))
-        })
-        .collect();
+    let task_files: Vec<&String> = tekton_files.iter().filter(|f| is_task_file(f)).collect();
+
 
     println!("[ginger-gitter] Applying {} user task file(s) …", task_files.len());
     for task_file in &task_files {
