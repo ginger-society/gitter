@@ -16,8 +16,8 @@ const SIDECAR_URL: &str = "http://ginger-gitter-sidecar:8080";
 
 #[derive(Debug, serde::Deserialize, utoipa::ToSchema)]
 pub struct TriggerPipelineRequest {
-    /// Gitolite repo path, e.g. `"acme/acme-api-service"`.
-    #[schema(example = "acme/acme-api-service")]
+    /// Gitolite repo path, e.g. `"acmecorp-api-service"` (`<org_id>-<project_name>`).
+    #[schema(example = "acmecorp-api-service")]
     pub repo: String,
 
     /// Branch name without the `refs/heads/` prefix.
@@ -70,9 +70,9 @@ pub async fn handle_trigger_pipeline(
     body: TriggerPipelineRequest,
     _state: AppState,
 ) -> Result<impl warp::Reply, Infallible> {
-    let repo       = body.repo.trim().to_string();
-    let branch     = body.branch.trim().to_string();
-    let gl_user    = body.triggered_by.as_deref().unwrap_or("manual").to_string();
+    let repo    = body.repo.trim().to_string();
+    let branch  = body.branch.trim().to_string();
+    let gl_user = body.triggered_by.as_deref().unwrap_or("manual").to_string();
 
     // ── Validate ──────────────────────────────────────────────────────────────
     if repo.is_empty() || repo.contains("..") {

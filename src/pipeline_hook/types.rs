@@ -30,4 +30,5 @@ pub struct PipelineRunContext {
     pub kubeconfig: Option<String>,
     pub sidecar_url: String,
     pub ginger_token: String,
+    pub org_id: String,
 }

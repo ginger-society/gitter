@@ -20,6 +20,7 @@ const SYSTEM_PARAMS: &[(&str, &str)] = &[
     ("gl_new_rev", "string"),
     ("image_tag",  "string"),
     ("repo",       "string"),
+    ("org_id",     "string"),
 ];
 
 /// Placeholder the user writes in secretKeyRef.name to reference the
@@ -112,6 +113,7 @@ pub fn build_pipeline_run(
     gl_repo: &str,
     gl_refname: &str,
     gl_new_rev: &str,
+    org_id: &str,
 ) -> String {
     let image_tag = gl_refname
         .strip_prefix("refs/heads/")
@@ -131,6 +133,7 @@ pub fn build_pipeline_run(
         ("gl_new_rev", gl_new_rev),
         ("image_tag",  image_tag),
         ("repo",       gl_repo),
+        ("org_id",     org_id),
     ] {
         params_yaml.push_str(&format!("    - name: {}\n      value: '{}'\n", k, v));
     }

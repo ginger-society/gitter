@@ -68,6 +68,8 @@ pub fn run(
     let workspace = resolve_workspace(gl_repo, admin_git_dir)?;
     println!("[ginger-gitter] Workspace: {}", workspace);
 
+    let org_id = workspace.clone();
+
     // ── 3. Verify repo path exists ────────────────────────────────────────────
     let repo_path = PathBuf::from(format!("{}/{}.git", repos_dir, gl_repo));
     if !repo_path.exists() {
@@ -213,6 +215,7 @@ pub fn run(
         kubeconfig: workspace_kubeconfig.clone(),
         sidecar_url: sidecar_url.to_string(),
         ginger_token: ginger_token.trim().to_string(),
+        org_id: org_id.to_string(),
     };
 
     println!("[ginger-gitter] Pipeline run context:");
@@ -372,6 +375,7 @@ fn trigger_pipeline(
         &ctx.gl_repo,
         &ctx.gl_refname,
         &ctx.gl_new_rev,
+        &ctx.org_id,
     );
 
     println!("[ginger-gitter] Creating PipelineRun for: {}", pipeline.pipeline_name);

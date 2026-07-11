@@ -56,8 +56,8 @@ pub struct PipelineParam {
 /// POST /repo/run-pipeline
 #[derive(Debug, serde::Deserialize, utoipa::ToSchema)]
 pub struct RunPipelineRequest {
-    /// Gitolite repo path, e.g. `"acme/acme-api-service"`.
-    #[schema(example = "acme/acme-api-service")]
+    /// Gitolite repo path, e.g. `"acmecorp-api-service"` (`<org_id>-<project_name>`).
+    #[schema(example = "acmecorp-api-service")]
     pub repo: String,
 
     /// Branch name (without `refs/heads/`).
@@ -197,6 +197,8 @@ pub async fn handle_run_pipeline(
         }
     };
     t!("Workspace: {workspace}");
+
+    let org_id = workspace.clone();
 
     // ── 4. Read tekton kubeconfig from admin repo ─────────────────────────────
     t!("Reading Tekton control-plane kubeconfig …");
@@ -477,6 +479,7 @@ pub async fn handle_run_pipeline(
         &repo,
         &refname,
         &new_rev,
+        &org_id,
     );
 
     t!("Creating PipelineRun …");
